@@ -1,0 +1,297 @@
+---
+title: "0703 CATE-RCT"
+format: html
+editor: visual
+---
+
+```{r}
+rm(list = ls())        # Removes all objects
+gc()                   # Garbage collection (optional, clears memory)
+
+#install.packages(c("dplyr", "pROC", "cobalt", "MASS", "ggplot2", "tidyr", "here"))
+```
+
+```{r}
+## -------------------------------------------------------------
+## Load WHI RCT slice and inspect MENO
+## -------------------------------------------------------------
+load("/Users/hill/Library/CloudStorage/Dropbox/WHI Data/cvd.RData")
+rct0 <- data[[2]]   # RCT slice
+
+# Count how many rows have MENO == 0 or MENO == NA
+meno_rct <- as.numeric(as.character(rct0$MENO))   # coerce safely
+n_zero <- sum(meno_rct == 0, na.rm = TRUE)        # how many 0s
+n_na   <- sum(is.na(meno_rct))                    # how many NAs
+n_total_missing <- sum(meno_rct == 0 | is.na(meno_rct))  # combined
+
+# Print counts
+cat("MENO == 0 in RCT:", n_zero, "\n")
+cat("MENO is NA in RCT:", n_na, "\n")
+cat("Total RCT rows needing imputation:", n_total_missing, "\n")
+```
+
+```{r}
+###############################################################################
+##  WHI HT – X-learner with GLMs + RCT bootstrap (clean numeric MENO + progress bar)
+###############################################################################
+library(dplyr)
+
+## --------------------------------------------------------------------------
+## 0. Load once and perform deterministic recodes
+## --------------------------------------------------------------------------
+load("/Users/hill/Library/CloudStorage/Dropbox/WHI Data/cvd.RData")
+
+# Load OBS cohort to reference later if needed
+obs <- data[[1]]
+
+# Step 1: Process RCT cohort, create raw variables
+rct0 <- data[[2]] %>%
+  mutate(
+    AGE_CAT = cut(
+      AGE,
+      breaks = c(49,54,59,64,69,74,79, Inf),
+      labels = c("50–54","55–59","60–64","65–69",
+                 "70–74","75–79","80+"), right = TRUE),
+
+    ETHNIC_GRP = factor(case_when(
+      ETHNIC == 5          ~ "White",
+      ETHNIC == 3          ~ "Black",
+      ETHNIC == 4          ~ "Hispanic",
+      ETHNIC %in% c(1,2,8) ~ "Other",
+      is.na(ETHNIC)        ~ "White",
+      TRUE                 ~ "White"  # fallback for unknowns
+    )),
+
+    SMOKING = factor(case_when(
+      as.numeric(as.character(SMOKING)) == 0 ~ "Never",
+      as.numeric(as.character(SMOKING)) == 1 ~ "Former",
+      as.numeric(as.character(SMOKING)) == 2 ~ "Current",
+      TRUE                                   ~ NA_character_)),
+
+    MENO_YRS = as.numeric(as.character(MENO)),
+
+    Test        = as.integer(Test),
+    Outcome.CHD = as.integer(Outcome.CHD),
+    BMI         = as.numeric(BMI),
+    WAIST       = as.numeric(WAIST),
+    WEIGHT      = as.numeric(WEIGHT),
+    OSTEOPOR    = as.numeric(OSTEOPOR),
+    VIGACT      = as.numeric(VIGACT),
+    HOTFLASH    = factor(HOTFLASH)
+  ) %>%
+  filter(AGE_CAT != "80+") %>%
+  droplevels()
+
+# Step 2: Impute invalid MENO_YRS (== 0) with 50
+rct0 <- rct0 %>%
+  mutate(
+    MENO_YRS = if_else(!is.na(MENO_YRS) & MENO_YRS == 0, 50, MENO_YRS)
+  )
+
+# ✅ DO NOT drop rows with missing values
+# rct0 <- rct0[complete.cases(rct0[, covars_x]), ]
+
+# Define modeling variables
+covars_x <- c("AGE_CAT","BMI","MENO_YRS","SMOKING","ETHNIC_GRP",
+              "WAIST","WEIGHT","HOTFLASH","OSTEOPOR","VIGACT")
+
+factor_vars <- c("AGE_CAT","SMOKING","ETHNIC_GRP","HOTFLASH")
+full_xlvls <- lapply(rct0[, factor_vars], levels)
+names(full_xlvls) <- factor_vars
+
+# --- EXPORT (mid-run): clean RCT prediction frame for OBS bootstrap ----------
+dir.create("~/Desktop/0718_Bootstrap", showWarnings = FALSE)
+
+# Stable row id AFTER all cleaning (drop “80+”, MENO fix, recodes)
+if (!"ROW_ID" %in% names(rct0)) rct0$ROW_ID <- seq_len(nrow(rct0))
+stopifnot(anyDuplicated(rct0$ROW_ID) == 0)
+
+# Lean covariate frame the OBS bootstrap will predict on
+X_rct <- rct0[, c(covars_x, "ROW_ID"), drop = FALSE]
+
+# Optional: which rows have all predictors present (diagnostic only)
+pred_mask_rct <- complete.cases(X_rct[, covars_x])
+
+# Save just what the OBS script needs to predict on RCT rows
+save(X_rct, covars_x, pred_mask_rct,
+     file = "/Users/hill/Desktop/0718_Bootstrap/RCT_covars_for_OBS_boot.RData")
+
+## --------------------------------------------------------------------------
+## 1. Helper – one bootstrap replicate
+## --------------------------------------------------------------------------
+fit_xlearner_once <- function(seed = NULL) {
+
+  if (!is.null(seed)) set.seed(seed)
+
+  ## 1A. sample rows with replacement
+  idx      <- sample(seq_len(nrow(rct0)), replace = TRUE)
+  rct_boot <- rct0[idx, ]
+
+  ## 1B. build modeling frame
+  df_all <- rct_boot[, c("Outcome.CHD", "Test", covars_x)]
+  keep   <- complete.cases(df_all)
+  df_all <- df_all[keep, ]
+
+  ## enforce factor levels
+  for (v in factor_vars) {
+    df_all[[v]] <- factor(df_all[[v]], levels = full_xlvls[[v]])
+  }
+
+  ## globals
+  Y  <- df_all$Outcome.CHD
+  W  <- df_all$Test
+  eX <- rep(mean(W), nrow(df_all))  # empirical PS per replicate
+  form <- reformulate(covars_x)
+
+  ## μ-models
+  mu1 <- glm(update(form, Outcome.CHD ~ .),
+             data = df_all[W == 1, ], family = binomial())
+  mu0 <- glm(update(form, Outcome.CHD ~ .),
+             data = df_all[W == 0, ], family = binomial())
+
+  mu1_hat <- predict(mu1, df_all, type = "response")
+  mu0_hat <- predict(mu0, df_all, type = "response")
+
+  ## pseudo-effects
+  D1 <- D0 <- rep(NA_real_, nrow(df_all))
+  D1[W == 1] <- Y[W == 1] - mu0_hat[W == 1]
+  D0[W == 0] <- mu1_hat[W == 0] - Y[W == 0]
+  df_all$D1 <- D1
+  df_all$D0 <- D0
+
+  ## τ-models
+  tau1 <- glm(D1 ~ ., data = df_all[W == 1, c("D1", covars_x)],
+              family = gaussian())
+  tau0 <- glm(D0 ~ ., data = df_all[W == 0, c("D0", covars_x)],
+              family = gaussian())
+
+  ## blended CATE prediction
+  tau_hat <- (1 - eX) * predict(tau1, df_all) +
+               eX      * predict(tau0, df_all)
+
+  ## align to original trial size using NA padding
+  out <- rep(NA_real_, nrow(rct0))
+  pos <- idx[keep]
+  out[pos] <- tau_hat
+  return(out)
+}
+
+## --------------------------------------------------------------------------
+## 2. Run 100 bootstrap replicates
+## --------------------------------------------------------------------------
+n_boot <- 100
+tau_matrix <- matrix(NA_real_, nrow = nrow(rct0), ncol = n_boot)
+
+pb <- txtProgressBar(min = 0, max = n_boot, style = 3)
+set.seed(2024)
+
+for (b in seq_len(n_boot)) {
+  tau_matrix[, b] <- fit_xlearner_once()
+  setTxtProgressBar(pb, b)
+}
+close(pb)
+
+B          <- tau_matrix
+f_r_hat    <- rowMeans(tau_matrix)
+var_r_hat  <- apply(tau_matrix, 1, var)
+
+## --------------------------------------------------------------------------
+## 2b. (NEW) Export RCT summaries for the shrinkage step
+## --------------------------------------------------------------------------
+dir.create("~/Desktop/0718_Bootstrap", showWarnings = FALSE)
+
+# Ensure stable row id is present (you created it earlier for X_rct; repeat-safe)
+if (!"ROW_ID" %in% names(rct0)) rct0$ROW_ID <- seq_len(nrow(rct0))
+stopifnot(anyDuplicated(rct0$ROW_ID) == 0)
+
+# Robust summaries (allow possible NAs in tau_matrix due to CC filters)
+f_r_hat   <- rowMeans(tau_matrix, na.rm = TRUE)
+var_r_hat <- apply(tau_matrix, 1, var, na.rm = TRUE)
+n_non_na  <- rowSums(!is.na(tau_matrix))
+
+# Mask rows that are safe to use downstream (≥2 non-NA replicates + finite stats)
+mask_shrink <- (n_non_na >= 2) & is.finite(f_r_hat) & is.finite(var_r_hat)
+
+# make ROW_ID explicitly available as a plain vector
+stopifnot("ROW_ID" %in% names(rct0))
+rct_row_id <- rct0[["ROW_ID"]]     # <- create a normal object in the env
+stopifnot(length(rct_row_id) == nrow(rct0), anyDuplicated(rct_row_id) == 0)
+
+# now save the summaries safely
+save(f_r_hat, var_r_hat, mask_shrink, rct_row_id,
+     file = "/Users/hill/Desktop/0718_Bootstrap/RCT_for_shrinkage_summaries.RData")
+
+
+# (Optional) keep the full B for diagnostics; you already do this elsewhere
+# save(rct0, tau_matrix, f_r_hat, var_r_hat, B,
+#      file = "/Users/hill/Desktop/0718_Bootstrap/RCT_bootstrap_B.RData")
+
+
+## --------------------------------------------------------------------------
+## 3. Inspect bootstrap variability
+## --------------------------------------------------------------------------
+boot_ATE <- colMeans(tau_matrix, na.rm = TRUE)
+summary(boot_ATE)
+hist(boot_ATE, breaks = 20,
+     main = "Bootstrap distribution of ATE (RCT slice)",
+     xlab = "Mean CATE per replicate")
+```
+
+```{r}
+# Check how many MENO_YRS values are missing, zero, or imputed (== 50)
+table(
+  is_na = is.na(rct0$MENO_YRS),
+  is_zero = rct0$MENO_YRS == 0,
+  is_imputed = rct0$MENO_YRS == 50
+)
+
+# Summary statistics
+summary(rct0$MENO_YRS)
+# Frequency table
+table(rct0$ETHNIC_GRP, useNA = "ifany")
+
+# Bar plot (optional)
+barplot(table(rct0$ETHNIC_GRP), 
+        main = "ETHNIC_GRP Distribution (RCT)",
+        ylab = "Count",
+        col = "skyblue")
+## ------------------------------------------------------------------
+## 4. Extra sanity checks  (OPTIONAL)
+## ------------------------------------------------------------------
+
+# 4A.  Proportion of NA’s in the whole τ̂ matrix
+prop_NA <- mean(is.na(tau_matrix))
+cat(sprintf("\nProportion of NA in tau_matrix: %.4f\n", prop_NA))
+
+# 4B.  Grand mean of row-wise averages (checks overall stability)
+grand_row_mean <- mean(rowMeans(tau_matrix, na.rm = TRUE), na.rm = TRUE)
+cat(sprintf("Grand mean of row-wise CATE averages: %.5f\n", grand_row_mean))
+
+# 4C.  Box-and-whisker plot of replicate ATEs
+boxplot(boot_ATE,
+        horizontal = TRUE,
+        main  = "Bootstrap ATEs (RCT slice)",
+        xlab  = "Mean CATE per replicate",
+        col   = "lightgray",
+        border = "darkgray")
+```
+
+```{r}
+## 5. Save objects
+dir.create("~/Desktop/0718_Bootstrap", showWarnings = FALSE)
+
+save(rct0, tau_matrix, f_r_hat, var_r_hat, B,
+     file = "/Users/hill/Desktop/0718_Bootstrap/RCT_bootstrap_B.RData")
+```
+
+```{r}
+# number of NAs in each covariate of the RCT slice
+na_by_var <- sapply(rct0[, covars_x], function(v) sum(is.na(v)))
+na_by_var
+# Reverify dimensions of cleaned RCT data and bootstrap matrix
+cat("Rows in rct0     :", nrow(rct0), "\n")
+cat("Rows in tau_matrix (B):", nrow(B), "\n")
+
+# Optional: hard-stop if not equal
+stopifnot(nrow(rct0) == nrow(B))
+```

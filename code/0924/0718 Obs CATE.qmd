@@ -1,0 +1,603 @@
+---
+title: "WHI PS Analysis"
+format: html
+editor: visual
+---
+
+```{r}
+rm(list = ls())        # Removes all objects
+gc()                   # Garbage collection (optional, clears memory)
+
+#install.packages(c("dplyr", "pROC", "cobalt", "MASS", "ggplot2", "tidyr", "here"))
+```
+
+```{r}
+## --------------------------------------------------------------------------
+## 0. Load OBS slice + BEFORE CLEANING check
+## --------------------------------------------------------------------------
+load("/Users/hill/Library/CloudStorage/Dropbox/WHI Data/cvd.RData")
+obs <- data[[1]]                     # observational cohort
+
+# ---- MENO Check BEFORE cleaning ----
+# Coerce safely to numeric (in case MENO is stored as factor)
+meno_obs <- as.numeric(as.character(obs$MENO))
+
+# Count 0s and NAs in MENO
+n_zero_obs <- sum(meno_obs == 0, na.rm = TRUE)
+n_na_obs   <- sum(is.na(meno_obs))
+n_total_obs_missing <- sum(meno_obs == 0 | is.na(meno_obs))
+
+# Print MENO summary
+cat("📍 MENO (before cleaning):\n")
+cat("  MENO == 0:", n_zero_obs, "\n")
+cat("  MENO is NA:", n_na_obs, "\n")
+cat("  Total needing imputation:", n_total_obs_missing, "\n\n")
+
+# ---- ETHNIC Check BEFORE cleaning ----
+n_ethnic_na <- sum(is.na(obs$ETHNIC))
+n_ethnic_0  <- sum(obs$ETHNIC == 0, na.rm = TRUE)
+n_ethnic_5  <- sum(obs$ETHNIC == 5, na.rm = TRUE)
+
+cat("📍 ETHNIC (before recode):\n")
+cat("  ETHNIC == NA:", n_ethnic_na, "\n")
+cat("  ETHNIC == 0:",  n_ethnic_0, "\n")
+cat("  ETHNIC == 5:",  n_ethnic_5, "\n")
+cat("  Total needing recode to 'White':", n_ethnic_na + n_ethnic_0, "\n")
+```
+
+```{r}
+###############################################################################
+##  WHI Observational Cohort – covariate cleaning + PS model comparison
+###############################################################################
+library(dplyr)
+library(pROC)      # for AUC
+library(cobalt)    # for balance diagnostics
+set.seed(123)
+
+## --------------------------------------------------------------------------
+## 0. Load OBS slice
+## --------------------------------------------------------------------------
+load("/Users/hill/Library/CloudStorage/Dropbox/WHI Data/cvd.RData")
+obs <- data[[1]]                     # observational cohort
+
+
+# 🛠 This line must be run BEFORE the mutate()
+obs$ETHNIC[is.na(obs$ETHNIC) | obs$ETHNIC == 0] <- 5
+
+## --------------------------------------------------------------------------
+## 1. Recode / type coercions  (mirror RCT cleaning)
+## --------------------------------------------------------------------------
+
+obs <- obs %>%
+  mutate(
+    # Age into 7 categories (drop "80+" later to mirror RCT)
+    AGE_CAT = cut(
+      AGE,
+      breaks = c(49, 54, 59, 64, 69, 74, 79, Inf),
+      labels = c("50–54", "55–59", "60–64", "65–69", 
+                 "70–74", "75–79", "80+"),
+      right = TRUE
+    ),
+
+    # Recode ETHNIC to 4-level factor
+    # Note: Treat 0 and NA as "White" (majority group)
+    ETHNIC_GRP = factor(case_when(
+      ETHNIC == 5            ~ "White",
+      ETHNIC == 3            ~ "Black",
+      ETHNIC == 4            ~ "Hispanic",
+      ETHNIC %in% c(1, 2, 8) ~ "Other",
+      ETHNIC == 0            ~ "White",          # 0 → White
+      is.na(ETHNIC)          ~ "White",          # NA → White
+      TRUE                   ~ "White"     # fallback for unexpected values
+    )),
+
+    # Recode SMOKING to 3-level factor
+    SMOKING = factor(case_when(
+      as.numeric(as.character(SMOKING)) == 0 ~ "Never",
+      as.numeric(as.character(SMOKING)) == 1 ~ "Former",
+      as.numeric(as.character(SMOKING)) == 2 ~ "Current",
+      TRUE                                   ~ NA_character_
+    )),
+
+    # Menopause years (0 → imputed with median)
+    MENO_YRS = as.numeric(as.character(MENO)),
+
+
+    # Numeric/integer conversions
+    Test        = as.integer(Test),          # treatment indicator
+    Outcome.CHD = as.integer(Outcome.CHD),
+    BMI         = as.numeric(BMI),
+    WAIST       = as.numeric(WAIST),
+    WEIGHT      = as.numeric(WEIGHT),
+    OSTEOPOR    = as.numeric(OSTEOPOR),
+    VIGACT      = as.numeric(VIGACT),
+    HOTFLASH    = factor(HOTFLASH)
+  )
+
+
+# Compute and apply OBS-based median for MENO imputation (excluding 0s and NAs)
+meno_median <- median(obs$MENO_YRS[obs$MENO_YRS > 0 & !is.na(obs$MENO_YRS)], na.rm = TRUE)
+
+obs <- obs %>%
+  mutate(
+    MENO_YRS = ifelse(MENO_YRS == 0 | is.na(MENO_YRS), meno_median, MENO_YRS)
+  )
+
+## --- drop “80+” age stratum to mirror RCT cleaning -------------------------
+obs <- obs[obs$AGE_CAT != "80+", ]
+obs$AGE_CAT <- droplevels(obs$AGE_CAT)
+
+## --------------------------------------------------------------------------
+## 2. Candidate covariate pool  (10 final variables)
+## --------------------------------------------------------------------------
+candidate_pool <- c("AGE_CAT", "BMI", "MENO_YRS", "SMOKING", "ETHNIC_GRP",
+                    "WAIST", "WEIGHT", "HOTFLASH", "OSTEOPOR", "VIGACT")
+
+## --------------------------------------------------------------------------
+## 3·A  Rank variables by univariate predictive strength
+## --------------------------------------------------------------------------
+score_var <- function(vname, dat) {
+  tmp <- dat[, c("Test", vname)]
+  tmp <- tmp[complete.cases(tmp), ]
+  if (nrow(tmp) == 0) return(NA)
+
+  v <- tmp[[vname]]
+
+  if (is.factor(v) || is.character(v)) {
+    mod <- glm(Test ~ ., data = tmp, family = binomial)
+    return(auc(roc(tmp$Test, fitted(mod), quiet = TRUE)))
+  }
+  if (is.numeric(v) || is.integer(v)) {
+    return(abs(cor(tmp$Test, v)))
+  }
+  NA
+}
+
+scores      <- sapply(candidate_pool, score_var, dat = obs)
+ranked_vars <- names(sort(scores, decreasing = TRUE, na.last = NA))
+
+## --------------------------------------------------------------------------
+## 3·B  Define covariate sets
+## --------------------------------------------------------------------------
+core_set   <- intersect(ranked_vars, c("AGE_CAT", "BMI", "MENO_YRS"))
+medium_set <- c(core_set, head(setdiff(ranked_vars, core_set), 2))
+full_set   <- ranked_vars
+
+## --------------------------------------------------------------------------
+## 3·C  Helper to fit PS model and diagnostics
+## --------------------------------------------------------------------------
+fit_ps <- function(varlist) {
+  df <- droplevels(obs[, c("Test", varlist)])
+  df <- df[complete.cases(df), ]
+  names(df)[1] <- "TEST"
+
+  mod <- glm(TEST ~ ., data = df, family = binomial)
+  ps  <- fitted(mod)
+  wt  <- ifelse(df$TEST == 1, 1/ps, 1/(1-ps))
+
+  bal <- bal.tab(TEST ~ ., data = df, weights = wt, estimand = "ATE")
+
+  list(model   = mod,
+       nVars   = length(varlist),
+       AIC     = AIC(mod),
+       AUC     = auc(roc(df$TEST, ps, quiet = TRUE)),
+       maxSMD  = max(abs(bal$Balance$Diff.Adj), na.rm = TRUE),
+       bal     = bal)
+}
+
+res_min  <- fit_ps(core_set)
+res_med  <- fit_ps(medium_set)
+res_full <- fit_ps(full_set)
+
+## --------------------------------------------------------------------------
+## 3·D  Summary table
+## --------------------------------------------------------------------------
+summary_tbl <- data.frame(
+  Model    = c("Minimal", "Medium", "Full"),
+  N_covars = c(res_min$nVars, res_med$nVars, res_full$nVars),
+  AIC      = c(res_min$AIC,   res_med$AIC,   res_full$AIC),
+  AUC      = c(res_min$AUC,   res_med$AUC,   res_full$AUC),
+  MaxSMD   = c(res_min$maxSMD, res_med$maxSMD, res_full$maxSMD)
+)
+print(summary_tbl)
+
+## --------------------------------------------------------------------------
+## 3·E  Love plots
+## --------------------------------------------------------------------------
+love.plot(res_min$bal,  abs = TRUE, title = "Covariate Balance – Minimal PS Model")
+love.plot(res_med$bal,  abs = TRUE, title = "Covariate Balance – Medium PS Model")
+love.plot(res_full$bal, abs = TRUE, title = "Covariate Balance – Full PS Model")
+
+```
+
+```{r}
+## ✅ Verification –
+
+# Count how many are in the 80+ age group (before dropping them)
+table(obs$AGE_CAT, useNA = "ifany")
+sum(obs$AGE_CAT == "80+", na.rm = TRUE)
+
+# 1. Check ETHNIC values
+cat("Check ETHNIC recoding:\n")
+cat("  NAs in ETHNIC:", sum(is.na(obs$ETHNIC)), "\n")
+cat("  ETHNIC == 0:", sum(obs$ETHNIC == 0, na.rm = TRUE), "\n")
+cat("  ETHNIC == 5:", sum(obs$ETHNIC == 5, na.rm = TRUE), "\n")
+cat("  ETHNIC_GRP == 'White':", sum(obs$ETHNIC_GRP == "White"), "\n")
+
+# 2. Check MENO_YRS values
+cat("\nCheck MENO_YRS recoding:\n")
+cat("  NAs in MENO_YRS:", sum(is.na(obs$MENO_YRS)), "\n")
+cat("  MENO_YRS == 0:", sum(obs$MENO_YRS == 0, na.rm = TRUE), "\n")
+cat("  Median used:", meno_median, "\n")
+
+# 3. Count ETHNIC_GRP categories
+cat("\nETHNIC_GRP breakdown:\n")
+print(table(obs$ETHNIC_GRP, useNA = "ifany"))
+```
+
+```{r}
+###############################################################################
+## SECTION 3 – Final Propensity-Score Model (AIC-selected) & Diagnostics
+###############################################################################
+
+library(MASS)    # stepAIC / step()
+library(pROC)    # AUC
+library(cobalt)  # balance diagnostics
+set.seed(123)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 3·A  Assemble modelling data  ➜ keep only complete cases
+# ─────────────────────────────────────────────────────────────────────────────
+cand_covars <- c("AGE_CAT", "BMI", "MENO_YRS", "SMOKING", "ETHNIC_GRP",
+                 "WAIST", "WEIGHT", "HOTFLASH", "OSTEOPOR", "VIGACT")
+
+df <- obs[, c("Test", cand_covars)]
+df <- df[complete.cases(df), ]        # ensure glm() & roc() vectors match
+names(df)[1] <- "TEST"                # rename for clarity
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 3·B  Full logistic model  ➜  stepwise AIC selection
+# ─────────────────────────────────────────────────────────────────────────────
+full_mod  <- glm(TEST ~ ., data = df, family = binomial)
+step_mod  <- step(full_mod, direction = "both", trace = FALSE)   # AIC criterion
+
+cat("Selected covariates:\n")
+print(all.vars(formula(step_mod))[-1])  # drop "TEST"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# 3·C  Propensity scores & regular (UN-stabilised) IPTW weights
+# ─────────────────────────────────────────────────────────────────────────────
+df$pscore <- fitted(step_mod)
+
+df$w_iptw <- ifelse(df$TEST == 1,
+                    1 / df$pscore,
+                    1 / (1 - df$pscore))
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 3·D  Model performance  (AUC) 
+# ─────────────────────────────────────────────────────────────────────────────
+auc_val <- auc(roc(df$TEST, df$pscore, quiet = TRUE))
+cat("\nAUC of final PS model:", round(auc_val, 3), "\n")
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 3·E  Balance diagnostics  (exclude pscore & w_iptw)
+# ─────────────────────────────────────────────────────────────────────────────
+bal_covars <- cand_covars  # the original confounder list
+
+bal_out <- bal.tab(TEST ~ ., 
+                   data     = df[, c("TEST", bal_covars)],
+                   weights  = df$w_iptw,   # ← switched from w_stab to w_iptw
+                   estimand = "ATE",
+                   un       = TRUE)
+
+# Print first few adjusted vs. unadjusted SMDs
+print(head(bal_out$Balance[, c("Diff.Un", "Diff.Adj")]))
+
+# Maximum post-weighting SMD
+max_adj <- max(abs(bal_out$Balance$Diff.Adj), na.rm = TRUE)
+cat("\nMaximum adjusted SMD:", round(max_adj, 3), "\n")
+
+# Love plot
+love.plot(bal_out,
+          abs   = TRUE,
+          stars = "raw",                            # flag raw vs. std differences
+          title = "Covariate Balance – Final AIC-Selected PS Model (Weighted)")
+
+###############################################################################
+## Outputs:
+##   • step_mod  – final PS model object
+##   • df$pscore – fitted propensity scores
+##   • df$w_iptw – regular (un-stabilised) IPTW weights   ✅ updated
+##   • bal_out   – balance table & SMDs
+##   • AUC       – model discrimination metric
+###############################################################################
+```
+
+```{r}
+# ==========================================================================
+# FINAL OBS.Rmd CODE CHUNK – Generates f_o_hat for ALL women (for shrinkage)
+# ==========================================================================
+set.seed(2025)
+
+# --------------------------------------------------------------------------
+# 4·A  IPTW outcome model (overall effect)
+# --------------------------------------------------------------------------
+df$Outcome.CHD <- obs$Outcome.CHD[match(rownames(df), rownames(obs))]
+
+iptw_mod <- glm(Outcome.CHD ~ TEST,
+                data    = df,
+                family  = quasibinomial(),
+                weights = df$w_iptw)
+
+# Diagnostics
+summary(iptw_mod)
+exp(cbind(OR = coef(iptw_mod), confint(iptw_mod)))
+cat("AIC (step_mod)  =", AIC(step_mod), "\n")
+cat("AUC (step_mod)  =", round(auc(roc(df$TEST, df$pscore, quiet = TRUE)), 3), "\n")
+cat("Max adj. SMD    =", round(max(abs(bal_out$Balance$Diff.Adj), na.rm = TRUE), 3), "\n")
+
+# --------------------------------------------------------------------------
+# 4·B  Propensity scores & capped weights for full OBS (keep all rows)
+# --------------------------------------------------------------------------
+obs$pscore <- predict(step_mod, newdata = obs, type = "response")
+obs$w_iptw <- ifelse(obs$Test == 1, 1 / obs$pscore, 1 / (1 - obs$pscore))
+obs$w_used <- pmin(obs$w_iptw, 10)  # cap weights at 10
+
+# --------------------------------------------------------------------------
+# 4·C  X-learner with GLMs (trained only on filtered OBS rows)
+# --------------------------------------------------------------------------
+covars_x <- c("AGE_CAT", "BMI", "MENO_YRS", "SMOKING",
+              "ETHNIC_GRP", "WAIST", "WEIGHT",
+              "HOTFLASH", "OSTEOPOR", "VIGACT")
+
+keep <- complete.cases(obs[, c(covars_x, "Outcome.CHD", "w_used", "pscore")]) &
+        obs$pscore > 0.01 & obs$pscore < 0.99
+
+df_all <- obs[keep, c("Outcome.CHD", "Test", "w_used", "pscore", covars_x)]
+Y  <- df_all$Outcome.CHD
+W  <- df_all$Test
+wt <- df_all$w_used
+eX <- df_all$pscore
+
+# μ-models
+rhs <- reformulate(covars_x)
+mu1_mod <- glm(update(rhs, Outcome.CHD ~ .),
+               data = df_all[W == 1, ], family = binomial(), weights = wt[W == 1])
+mu0_mod <- glm(update(rhs, Outcome.CHD ~ .),
+               data = df_all[W == 0, ], family = binomial(), weights = wt[W == 0])
+
+mu1_hat <- predict(mu1_mod, df_all, type = "response")
+mu0_hat <- predict(mu0_mod, df_all, type = "response")
+
+# Pseudo-effects
+D1 <- D0 <- rep(NA_real_, length(Y))
+D1[W == 1] <- Y[W == 1] - mu0_hat[W == 1]
+D0[W == 0] <- mu1_hat[W == 0] - Y[W == 0]
+
+# τ-models
+df_tau1 <- data.frame(D = D1[W == 1], df_all[W == 1, covars_x])
+df_tau0 <- data.frame(D = D0[W == 0], df_all[W == 0, covars_x])
+
+tau1_mod <- glm(D ~ ., data = df_tau1, family = gaussian(), weights = wt[W == 1])
+tau0_mod <- glm(D ~ ., data = df_tau0, family = gaussian(), weights = wt[W == 0])
+
+# --------------------------------------------------------------------------
+# 5. Predict OBS-based CATEs for ALL women (OBS + RCT) — this is f_o_hat
+# --------------------------------------------------------------------------
+X_all <- obs[, covars_x]
+eX_all <- obs$pscore
+
+mu1_all <- predict(mu1_mod, newdata = X_all, type = "response")
+mu0_all <- predict(mu0_mod, newdata = X_all, type = "response")
+tau1_all <- predict(tau1_mod, newdata = X_all)
+tau0_all <- predict(tau0_mod, newdata = X_all)
+
+# Final OBS-based CATEs
+f_o_hat <- (1 - eX_all) * tau1_all + eX_all * tau0_all
+
+# Sanity check
+cat("Length f_o_hat (ALL):", length(f_o_hat), "\n")
+cat("NA count:", sum(is.na(f_o_hat)), "\n")
+summary(f_o_hat)
+
+# Save for shrinkage step
+save(f_o_hat, step_mod, mu1_mod, mu0_mod, tau1_mod, tau0_mod,
+     file = "/Users/hill/Desktop/0718_Bootstrap/OBS_final_results.RData")
+
+```
+
+```{r}
+cat("Length f_o_hat:", length(f_o_hat), "\n")    # Should be ~
+cat("NA count:", sum(is.na(f_o_hat)), "\n")      # Should be 0
+print(summary(f_o_hat))
+```
+
+```{r}
+###############################################################################
+## 5) OBS bootstrap -> predict on RCT rows each replicate
+##  Outputs:
+##    - B_obs : K x B matrix of OBS CATE predictions on RCT rows
+##    - var_b : length-K row variances from B_obs (diag Σ_b)
+##    - tau_b : length-K point estimate on RCT rows (from one main OBS fit)
+###############################################################################
+library(dplyr)
+
+## --- Load cleaned RCT predictors exported by the RCT script -----------------
+## provides: X_rct (covariate frame with ROW_ID), covars_x, (optionally pred_mask_rct)
+load("/Users/hill/Desktop/0718_Bootstrap/RCT_covars_for_OBS_boot.RData")
+
+## --- Align to RCT summaries (order + mask) ---------------------------------
+## guarantees 1–1 row alignment with RCT-side summaries used in shrinkage
+## provides: f_r_hat, var_r_hat, mask_shrink, rct_row_id
+load("/Users/hill/Desktop/0718_Bootstrap/RCT_for_shrinkage_summaries.RData")
+stopifnot(length(rct_row_id) == nrow(X_rct))
+if (!identical(rct_row_id, X_rct$ROW_ID)) {
+  ord <- match(rct_row_id, X_rct$ROW_ID)
+  if (any(is.na(ord))) stop("ROW_ID mismatch between RCT summaries and X_rct")
+  X_rct <- X_rct[ord, , drop = FALSE]
+}
+
+## --- prerequisites assumed from previous sections --------------------------
+## obs     : observational cohort (already cleaned in Sections 0–4)
+## step_mod: final AIC-selected PS model fit on OBS (Section 3)
+## covars_x: c("AGE_CAT","BMI","MENO_YRS","SMOKING","ETHNIC_GRP",
+##             "WAIST","WEIGHT","HOTFLASH","OSTEOPOR","VIGACT")
+
+## 0) Harmonize factor levels across OBS and RCT (robust to unseen levels)
+factor_vars <- c("AGE_CAT","SMOKING","ETHNIC_GRP","HOTFLASH")
+for (v in factor_vars) {
+  lvls_union <- union(levels(droplevels(obs[[v]])), levels(droplevels(X_rct[[v]])))
+  obs[[v]]   <- factor(obs[[v]],  levels = lvls_union)
+  X_rct[[v]] <- factor(X_rct[[v]], levels = lvls_union)
+}
+# sanity: predictors exist and are complete on RCT rows (or subset using pred_mask_rct)
+stopifnot(all(covars_x %in% colnames(X_rct)))
+stopifnot(all(complete.cases(X_rct[, covars_x])))
+
+## 1) Helper: one OBS bootstrap replicate -> CATEs on RCT rows
+obs_boot_once <- function(seed = NULL, weight_cap = 10) {
+  if (!is.null(seed)) set.seed(seed)
+
+  # 1A. stratified resample OBS rows with replacement (stabilizes PS tails)
+  idx_t <- sample(which(obs$Test == 1), replace = TRUE)
+  idx_c <- sample(which(obs$Test == 0), replace = TRUE)
+  ob    <- obs[c(idx_t, idx_c), , drop = FALSE]
+
+  # 1B. PS model on bootstrap sample with stepwise AIC (mirrors Section 3)
+  df_ps <- ob[, c("Test", covars_x)]
+  df_ps <- df_ps[complete.cases(df_ps), ]
+  names(df_ps)[1] <- "TEST"
+
+  full_mod_b <- glm(TEST ~ ., data = df_ps, family = binomial())
+  step_mod_b <- suppressWarnings(step(full_mod_b, direction = "both", trace = FALSE))
+
+  # propensity scores on bootstrap sample & IPTW weights (capped)
+  df_ps$pscore <- fitted(step_mod_b)
+  df_ps$w_iptw <- ifelse(df_ps$TEST == 1, 1 / df_ps$pscore, 1 / (1 - df_ps$pscore))
+  df_ps$w_used <- pmin(df_ps$w_iptw, weight_cap)
+
+  # 1C. Build outcome/X-learner frame (mirror Section 4 filters)
+  ob$pscore <- predict(step_mod_b, newdata = ob, type = "response")
+  ob$w_iptw <- ifelse(ob$Test == 1, 1 / ob$pscore, 1 / (1 - ob$pscore))
+  ob$w_used <- pmin(ob$w_iptw, weight_cap)
+
+  keep <- complete.cases(ob[, c(covars_x, "Outcome.CHD", "w_used", "pscore")]) &
+          ob$pscore > 0.01 & ob$pscore < 0.99
+
+  df_all <- ob[keep, c("Outcome.CHD", "Test", "w_used", "pscore", covars_x)]
+  if (nrow(df_all) < 50) return(rep(NA_real_, nrow(X_rct)))  # extreme guard
+
+  Y  <- df_all$Outcome.CHD
+  W  <- df_all$Test
+  wt <- df_all$w_used
+  rhs <- reformulate(covars_x)
+
+  # 1D. μ-models (weighted outcome GLMs) — use quasibinomial to avoid warnings
+  mu1_mod_b <- glm(update(rhs, Outcome.CHD ~ .),
+                   data = df_all[W == 1, ],
+                   family = quasibinomial(),   # CHANGED
+                   weights = wt[W == 1])
+  mu0_mod_b <- glm(update(rhs, Outcome.CHD ~ .),
+                   data = df_all[W == 0, ],
+                   family = quasibinomial(),   # CHANGED
+                   weights = wt[W == 0])
+
+  # 1E. pseudo-effects
+  mu1_hat <- predict(mu1_mod_b, df_all, type = "response")
+  mu0_hat <- predict(mu0_mod_b, df_all, type = "response")
+  D1 <- D0 <- rep(NA_real_, nrow(df_all))
+  D1[W == 1] <- Y[W == 1] - mu0_hat[W == 1]
+  D0[W == 0] <- mu1_hat[W == 0] - Y[W == 0]
+
+  # τ-models (gaussian), weighted
+  df_tau1 <- data.frame(D = D1[W == 1], df_all[W == 1, covars_x, drop = FALSE])
+  df_tau0 <- data.frame(D = D0[W == 0], df_all[W == 0, covars_x, drop = FALSE])
+
+  tau1_mod_b <- glm(D ~ ., data = df_tau1, family = gaussian(), weights = wt[W == 1])
+  tau0_mod_b <- glm(D ~ ., data = df_tau0, family = gaussian(), weights = wt[W == 0])
+
+  # 1F. Predict on RCT rows for this replicate (key!)
+  XR      <- X_rct[, covars_x, drop = FALSE]
+  eX_rct  <- predict(step_mod_b, newdata = X_rct, type = "response")
+  tau1_r  <- predict(tau1_mod_b, newdata = XR)
+  tau0_r  <- predict(tau0_mod_b, newdata = XR)
+
+  tau_hat_rct <- (1 - eX_rct) * tau1_r + eX_rct * tau0_r
+  as.numeric(tau_hat_rct)
+}
+
+## 2) Run OBS bootstraps
+B_obs <- 400L                            # CHANGED: quick smoke test; bump later to 400
+K     <- nrow(X_rct)
+Bmat  <- matrix(NA_real_, nrow = K, ncol = B_obs)
+
+pb <- txtProgressBar(min = 0, max = B_obs, style = 3)
+set.seed(2026)
+for (b in seq_len(B_obs)) {
+  Bmat[, b] <- obs_boot_once()
+  setTxtProgressBar(pb, b)
+}
+close(pb)
+
+## 3) Row-variance on RCT rows => diag Σ_b
+var_b <- apply(Bmat, 1, var, na.rm = TRUE)
+B_obs <- Bmat  # keep for diagnostics (not masked)
+
+## 4) One "main" OBS fit (no bootstrap) -> point estimate on RCT rows
+# reuse your Section 3 step_mod (AIC-selected on full OBS)
+obs$pscore <- predict(step_mod, newdata = obs, type = "response")
+obs$w_iptw <- ifelse(obs$Test == 1, 1 / obs$pscore, 1 / (1 - obs$pscore))
+obs$w_used <- pmin(obs$w_iptw, 10)
+
+keep_main <- complete.cases(obs[, c(covars_x, "Outcome.CHD", "w_used", "pscore")]) &
+             obs$pscore > 0.01 & obs$pscore < 0.99
+df_all_m  <- obs[keep_main, c("Outcome.CHD","Test","w_used","pscore", covars_x)]
+
+Y  <- df_all_m$Outcome.CHD
+W  <- df_all_m$Test
+wt <- df_all_m$w_used
+rhs <- reformulate(covars_x)
+
+# weighted outcome GLMs for the main fit (use quasibinomial here too)
+mu1_m <- glm(update(rhs, Outcome.CHD ~ .),
+             data = df_all_m[W == 1, ],
+             family = quasibinomial(),   # CHANGED
+             weights = wt[W == 1])
+mu0_m <- glm(update(rhs, Outcome.CHD ~ .),
+             data = df_all_m[W == 0, ],
+             family = quasibinomial(),   # CHANGED
+             weights = wt[W == 0])
+
+mu1_hat_m <- predict(mu1_m, df_all_m, type = "response")
+mu0_hat_m <- predict(mu0_m, df_all_m, type = "response")
+D1 <- D0 <- rep(NA_real_, nrow(df_all_m))
+D1[W == 1] <- Y[W == 1] - mu0_hat_m[W == 1]
+D0[W == 0] <- mu1_hat_m[W == 0] - Y[W == 0]
+
+tau1_m <- glm(D1 ~ ., data = data.frame(D1 = D1[W == 1], df_all_m[W == 1, covars_x]),
+              family = gaussian(), weights = wt[W == 1])
+tau0_m <- glm(D0 ~ ., data = data.frame(D0 = D0[W == 0], df_all_m[W == 0, covars_x]),
+              family = gaussian(), weights = wt[W == 0])
+
+# predict on RCT rows (point estimate)
+XR           <- X_rct[, covars_x, drop = FALSE]
+eX_rct_main  <- predict(step_mod, newdata = X_rct, type = "response")
+tau1_r_main  <- predict(tau1_m, newdata = XR)
+tau0_r_main  <- predict(tau0_m, newdata = XR)
+tau_b        <- (1 - eX_rct_main) * tau1_r_main + eX_rct_main * tau0_r_main  # length K
+
+## 4b) Enforce the same RCT mask used in the RCT summaries
+var_b <- var_b[mask_shrink]
+tau_b <- tau_b[mask_shrink]
+
+rct_row_id <- X_rct$ROW_ID
+save(B_obs, var_b, tau_b, rct_row_id, mask_shrink,
+     file = here::here("OBS_bootstrap_on_RCT.RData"))
+
+## quick sanity prints (nice for log)
+cat("tr(Sigma_b):", sum(var_b, na.rm = TRUE), "\n")
+cat("B_obs dim:", paste(dim(B_obs), collapse = " x "), "\n")
+cat("var_b length:", length(var_b), "  NAs:", sum(is.na(var_b)), "\n")
+cat("tau_b length:", length(tau_b), "  NAs:", sum(is.na(tau_b)), "\n")
+```

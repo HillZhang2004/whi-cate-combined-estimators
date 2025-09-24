@@ -1,0 +1,1419 @@
+---
+title: "combined_estimator.Rmd"
+format: html
+editor: visual
+---
+
+```{r}
+rm(list = ls())        # Removes all objects
+gc()                   # Garbage collection (optional, clears memory)
+
+#install.packages(c("dplyr", "pROC", "cobalt", "MASS", "ggplot2", "tidyr", "here"))
+```
+
+```{r}
+# ==========================================================================
+# NEW SECTION: Predict OBS-based CATEs on RCT rows (for shrinkage alignment)
+# ==========================================================================
+
+# Load OBS-trained models
+load("OBS_final_results.RData")    # step_mod, mu1_mod, mu0_mod, tau1_mod, tau0_mod, ...
+
+# Load RCT covariate data
+load("/Users/hill/Library/CloudStorage/Dropbox/WHI Data/cvd.RData")
+rct_data <- data[[2]]   # RCT slice
+
+library(dplyr)
+
+# --------------------------
+# Clean RCT data
+# --------------------------
+rct0 <- rct_data %>%
+  mutate(
+    AGE_CAT = cut(
+      AGE, breaks = c(49,54,59,64,69,74,79, Inf),
+      labels = c("50–54","55–59","60–64","65–69","70–74","75–79","80+"),
+      right = TRUE
+    ),
+    ETHNIC_GRP = factor(case_when(
+      ETHNIC == 5          ~ "White",
+      ETHNIC == 3          ~ "Black",
+      ETHNIC == 4          ~ "Hispanic",
+      ETHNIC %in% c(1,2,8) ~ "Other",
+      is.na(ETHNIC)        ~ "White",
+      TRUE                 ~ "White"
+    )),
+    SMOKING = factor(case_when(
+      as.numeric(as.character(SMOKING)) == 0 ~ "Never",
+      as.numeric(as.character(SMOKING)) == 1 ~ "Former",
+      as.numeric(as.character(SMOKING)) == 2 ~ "Current",
+      TRUE                                   ~ NA_character_
+    )),
+    MENO_YRS    = as.numeric(as.character(MENO)),
+    Test        = as.integer(Test),
+    Outcome.CHD = as.integer(Outcome.CHD),
+    BMI         = as.numeric(BMI),
+    WAIST       = as.numeric(WAIST),
+    WEIGHT      = as.numeric(WEIGHT),
+    OSTEOPOR    = as.numeric(OSTEOPOR),
+    VIGACT      = as.numeric(VIGACT),
+    HOTFLASH    = factor(HOTFLASH)
+  ) %>%
+  filter(AGE_CAT != "80+") %>%
+  droplevels() %>%
+  mutate(MENO_YRS = if_else(!is.na(MENO_YRS) & MENO_YRS == 0, 50, MENO_YRS))
+
+rct_data <- rct0
+
+# --- A1) If available, align rows by ROW_ID used elsewhere (optional here)
+# (Only runs if rct_row_id already exists in the session)
+if (!"ROW_ID" %in% names(rct_data) && exists("rct_row_id")) rct_data$ROW_ID <- rct_row_id
+if (exists("rct_row_id")) {
+  stopifnot(length(rct_row_id) == nrow(rct_data))
+  if (!identical(rct_row_id, rct_data$ROW_ID)) {
+    ord <- match(rct_row_id, rct_data$ROW_ID); stopifnot(!any(is.na(ord)))
+    rct_data <- rct_data[ord, , drop = FALSE]
+  }
+}
+
+# --- A2) Harmonize factor levels to OBS-trained models (avoid new-level issues)
+harmonize_levels <- function(df, mdl) {
+  if (!is.null(mdl$xlevels)) {
+    fac_vars <- intersect(names(mdl$xlevels), colnames(df))
+    for (v in fac_vars) {
+      df[[v]] <- factor(df[[v]], levels = union(mdl$xlevels[[v]], levels(droplevels(df[[v]]))))
+    }
+  }
+  df
+}
+rct_data <- harmonize_levels(rct_data, step_mod)
+rct_data <- harmonize_levels(rct_data, mu1_mod)
+rct_data <- harmonize_levels(rct_data, mu0_mod)
+rct_data <- harmonize_levels(rct_data, tau1_mod)
+rct_data <- harmonize_levels(rct_data, tau0_mod)
+
+# Predictors used by the OBS models
+covars_x <- c("AGE_CAT","BMI","MENO_YRS","SMOKING","ETHNIC_GRP",
+              "WAIST","WEIGHT","HOTFLASH","OSTEOPOR","VIGACT")
+X_rct <- rct_data[, covars_x, drop = FALSE]
+
+# PS from OBS step_mod (OK to use rct_data here)
+eX_rct <- predict(step_mod, newdata = rct_data, type = "response")
+
+# OBS μ-models and τ-models on RCT rows
+mu1_rct  <- predict(mu1_mod,  newdata = X_rct, type = "response")
+mu0_rct  <- predict(mu0_mod,  newdata = X_rct, type = "response")
+tau1_rct <- predict(tau1_mod, newdata = X_rct)
+tau0_rct <- predict(tau0_mod, newdata = X_rct)
+
+# X-learner CATEs on RCT rows
+f_o_hat_rct <- (1 - eX_rct) * tau1_rct + eX_rct * tau0_rct
+
+# Save (unmasked)
+save(f_o_hat_rct, file = "f_o_hat_on_RCT.RData")
+
+# Quick validation
+cat("✅ Length f_o_hat_rct:", length(f_o_hat_rct), "\n")
+cat("✅ Should equal:", nrow(rct_data), "\n")
+
+```
+
+```{r}
+# -----------------------------------------------------
+# Load RCT bootstrap results (gives B) and compute RCT stats
+# -----------------------------------------------------
+load("RCT_bootstrap_B.RData")          # expects B (K x B_obs)
+f_r_hat   <- rowMeans(B, na.rm = TRUE)
+var_r_hat <- apply(B, 1, var, na.rm = TRUE)
+
+# -----------------------------------------------------
+# Load ids + mask used by shrinkage (source of truth)
+# -----------------------------------------------------
+load("OBS_bootstrap_on_RCT.RData")     # provides: rct_row_id, mask_shrink (and others)
+stopifnot(length(rct_row_id) == length(f_r_hat),
+          length(mask_shrink) == length(f_r_hat))
+
+# -----------------------------------------------------
+# Load OBS predictions on RCT rows (from first chunk)
+# -----------------------------------------------------
+load("f_o_hat_on_RCT.RData")           # f_o_hat_rct
+f_o_hat <- f_o_hat_rct                 # align name
+
+# (Optional) If rct_data is in memory, assert alignment
+if (exists("rct_data")) {
+  stopifnot("ROW_ID" %in% names(rct_data))
+  stopifnot(nrow(rct_data) == length(rct_row_id))
+  # If needed, reorder rct_data to match rct_row_id
+  if (!identical(rct_data$ROW_ID, rct_row_id)) {
+    ord <- match(rct_row_id, rct_data$ROW_ID); stopifnot(!any(is.na(ord)))
+    rct_data <- rct_data[ord, , drop = FALSE]
+  }
+}
+
+# -----------------------------------------------------
+# Compute λ's on masked rows, then expand back to full length
+# -----------------------------------------------------
+idx  <- which(mask_shrink)
+fr_m <- f_r_hat[idx];  fo_m <- f_o_hat[idx];  vr_m <- var_r_hat[idx]
+
+# λ_URE (scalar)
+lambda_URE <- sum(vr_m) / sum((fr_m - fo_m)^2)
+f_combined_m <- (1 - lambda_URE) * fr_m + lambda_URE * fo_m
+
+# λ₂ (row-specific)
+vr_sq_m   <- vr_m^2
+diff_sq_m <- (fr_m - fo_m)^2
+lambda2_m <- (sum(vr_sq_m) * vr_m) / sum(vr_sq_m * diff_sq_m)
+f_combined2_m <- (1 - lambda2_m) * fr_m + lambda2_m * fo_m
+
+# Expand to full length (NA outside mask)
+K <- length(f_r_hat)
+f_combined   <- rep(NA_real_, K); f_combined[idx]  <- f_combined_m
+f_combined2  <- rep(NA_real_, K); f_combined2[idx] <- f_combined2_m
+lambda2_vec  <- rep(NA_real_, K); lambda2_vec[idx] <- lambda2_m
+
+# -----------------------------------------------------
+# Save and output results (with IDs)
+# -----------------------------------------------------
+results_df <- data.frame(
+  ROW_ID                = rct_row_id,
+  tau_R                 = f_r_hat,
+  tau_O                 = f_o_hat,
+  var_tau_R             = var_r_hat,
+  lambda_URE            = rep(lambda_URE, K),
+  lambda2               = lambda2_vec,
+  tau_combined_lambda1  = f_combined,
+  tau_combined_lambda2  = f_combined2
+)
+
+save(results_df, f_r_hat, f_o_hat, f_combined, f_combined2,
+     lambda_URE, lambda2_vec, rct_row_id, mask_shrink,
+     file = "combined_estimators_results.RData")
+
+write.csv(results_df, "combined_estimators_results.csv", row.names = FALSE)
+
+```
+
+```{r}
+# ==========================================================================
+# CHUNK 3 — Individual-level Double-Shrinkage (Moment Matching) Combiner
+# ==========================================================================
+
+# Inputs expected in env (FULL length, unmasked):
+#   f_r_hat   : RCT point estimates per row        -> "b"
+#   var_r_hat : RCT row variances                  -> σ^2_{b,i}
+# Optional:
+#   f_o_hat   : OBS-on-RCT predictions (point est) -> "u"
+# Loaded from OBS bootstrap file (FULL length, unmasked):
+#   var_b     : OBS row variances on RCT rows      -> σ^2_{u,i}
+#   tau_b     : OBS point estimates on RCT rows    -> τ̂_u
+#   mask_shrink (logical), rct_row_id
+
+# ---- Robust load ----
+suppressMessages({
+  if (!requireNamespace("here", quietly = TRUE)) { }
+  if (!requireNamespace("dplyr", quietly = TRUE)) { }
+})
+obs_boot_path <- if (requireNamespace("here", quietly = TRUE)) here::here("OBS_bootstrap_on_RCT.RData") else "OBS_bootstrap_on_RCT.RData"
+stopifnot(file.exists(obs_boot_path))
+load(obs_boot_path)   # expects: var_b, tau_b, mask_shrink, rct_row_id
+stopifnot(all(c("var_b","tau_b","mask_shrink","rct_row_id") %in% ls()))
+
+# ---- Basic shape checks (full length) ----
+stopifnot(is.logical(mask_shrink))
+L <- length(mask_shrink)
+stopifnot(length(var_b)      == L,
+          length(tau_b)      == L,
+          length(rct_row_id) == L)
+
+# Ensure RCT-side summaries are also full length
+stopifnot(length(f_r_hat)   == L,
+          length(var_r_hat) == L)
+
+# Use OBS point estimates from file if f_o_hat isn't already set
+if (!exists("f_o_hat")) f_o_hat <- tau_b
+stopifnot(length(f_o_hat) == L)
+
+# ---- Mask once; keep originals intact ----
+idx          <- which(mask_shrink)
+N            <- length(idx)
+row_id       <- rct_row_id[idx]
+
+var_obs_m    <- var_b[idx]        # σ^2_{u,i} masked
+f_o_hat_m    <- f_o_hat[idx]      # τ̂_u masked
+
+f_r_hat_m    <- f_r_hat[idx]      # τ̂_b masked
+var_r_hat_m  <- var_r_hat[idx]    # σ^2_{b,i} masked
+
+stopifnot(N > 0,
+          length(var_obs_m)   == N,
+          length(f_o_hat_m)   == N,
+          length(f_r_hat_m)   == N,
+          length(var_r_hat_m) == N)
+
+# ---- Step 2: moment-matching scalars (positive-part) ----
+pos_part  <- function(x) pmax(x, 0)
+
+Su        <- sum(var_obs_m)                       # tr(Σ_u)
+Sb        <- sum(var_r_hat_m)                     # tr(Σ_b)
+Su_point  <- sum(f_o_hat_m^2)                     # ||τ̂_u||^2
+Sb_point  <- sum(f_r_hat_m^2)                     # ||τ̂_b||^2
+Sd        <- sum((f_o_hat_m - f_r_hat_m)^2)       # ||τ̂_u - τ̂_b||^2
+
+eta2      <- pos_part((Su_point - Su) / N)                 # η̂^2_mm
+gamma2_1  <- pos_part((Sd - Su - Sb) / N)                  # γ̂^2_mm,1
+gamma2_2  <- pos_part((Sb_point - Su_point + Su - Sb) / N) # γ̂^2_mm,2
+
+# ---- Step 3: per-individual weights ----
+clip01 <- function(x) pmin(pmax(x, 0), 1)
+
+# λ_i = (γ^2 + σ^2_{b,i}) / (γ^2 + σ^2_{b,i} + σ^2_{u,i})
+lambda_fun <- function(g2, s2_obs, s2_rct) {
+  den <- g2 + s2_rct + s2_obs
+  val <- ifelse(den > 0, (g2 + s2_rct) / den, 0)
+  clip01(val)
+}
+
+# a_i = [η^2 (γ^2 + σ^2_{b,i} + σ^2_{u,i})] /
+#       [σ^2_{u,i}(γ^2 + σ^2_{b,i}) + η^2 (γ^2 + σ^2_{b,i} + σ^2_{u,i})]
+a_fun <- function(g2, eta2, s2_obs, s2_rct) {
+  num <- eta2 * (g2 + s2_rct + s2_obs)
+  den <- s2_obs * (g2 + s2_rct) + eta2 * (g2 + s2_rct + s2_obs)
+  val <- ifelse(den > 0, num / den, 0)
+  clip01(val)
+}
+
+lam1 <- lambda_fun(gamma2_1, var_obs_m,  var_r_hat_m)
+lam2 <- lambda_fun(gamma2_2, var_obs_m,  var_r_hat_m)
+a1   <- a_fun     (gamma2_1, eta2,       var_obs_m,  var_r_hat_m)
+a2   <- a_fun     (gamma2_2, eta2,       var_obs_m,  var_r_hat_m)
+
+# ---- Step 4: two combined estimators (row-level) ----
+psi_MM1 <- a1 * (lam1 * f_o_hat_m + (1 - lam1) * f_r_hat_m)
+psi_MM2 <- a2 * (lam2 * f_o_hat_m + (1 - lam2) * f_r_hat_m)
+
+# ---- Output frame (masked rows only) ----
+mm_cols <- data.frame(
+  ROW_ID = row_id,              # <- use ROW_ID (not ID)
+  eta2 = rep(eta2, N),
+  gamma2_1 = rep(gamma2_1, N),
+  gamma2_2 = rep(gamma2_2, N),
+  lambda_MM1 = lam1,
+  lambda_MM2 = lam2,
+  a_MM1 = a1,
+  a_MM2 = a2,
+  tau_combined_MM1 = psi_MM1,
+  tau_combined_MM2 = psi_MM2,
+  stringsAsFactors = FALSE
+)
+
+# ---- Merge with existing results, keyed by ROW_ID (safer than cbind) ----
+if (exists("results_df")) {
+  # if results_df was created earlier with an 'ID' key, rename it once here
+  if (!"ROW_ID" %in% names(results_df) && "ID" %in% names(results_df)) {
+    results_df <- dplyr::rename(results_df, ROW_ID = ID)
+  }
+  if (!"ROW_ID" %in% names(results_df)) {
+    stop("results_df exists but has no 'ROW_ID' column to join on")
+  }
+  # coerce key types if needed to avoid mismatched factor/character
+  if (!inherits(results_df$ROW_ID, class(mm_cols$ROW_ID))) {
+    results_df$ROW_ID <- as.character(results_df$ROW_ID)
+    mm_cols$ROW_ID    <- as.character(mm_cols$ROW_ID)
+  }
+  if (requireNamespace("dplyr", quietly = TRUE)) {
+    results_df <- dplyr::left_join(results_df, mm_cols, by = "ROW_ID")
+  } else {
+    # fallback: identical order check before cbind
+    stopifnot(identical(results_df$ROW_ID, mm_cols$ROW_ID))
+    results_df <- cbind(results_df, mm_cols[setdiff(names(mm_cols), "ROW_ID")])
+  }
+} else {
+  results_df <- mm_cols
+}
+```
+
+```{r}
+# ---- Libraries ----
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+
+# Use the same mask as in Chunk 3
+common_idx <- which(mask_shrink)
+
+# Mask everything for fair, 1–1 comparison
+fo_m  <- f_o_hat[common_idx]
+fr_m  <- f_r_hat[common_idx]
+fc_m  <- f_combined[common_idx]      # λ_URE combined (masked)
+fc2_m <- f_combined2[common_idx]     # λ₂ row-specific (masked)
+mm1_m <- psi_MM1                     # already masked in Chunk 3
+mm2_m <- psi_MM2                     # already masked in Chunk 3
+
+# Build long df without assuming equal lengths by block
+plot_df_all <- bind_rows(
+  data.frame(Method = "OBS: f̂_o(x)",                          CATE = fo_m),
+  data.frame(Method = "RCT: f̂_r(x)",                          CATE = fr_m),
+  data.frame(Method = "Combined MM1: ψ̂_MM1(x)",               CATE = mm1_m),  # <-- MM1 now top-right
+  data.frame(Method = "Combined λ_URE: f̂_c(x)",               CATE = fc_m),
+  data.frame(Method = "Combined λ₂ (Row-Specific): f̂_c2(x)",  CATE = fc2_m),
+  data.frame(Method = "Combined MM2: ψ̂_MM2(x)",               CATE = mm2_m)
+)
+
+# Facet order (top row: OBS, RCT, MM1; bottom row: λ_URE, λ₂, MM2)
+desired_levels <- c(
+  "OBS: f̂_o(x)",
+  "RCT: f̂_r(x)",
+  "Combined MM1: ψ̂_MM1(x)",
+  "Combined λ_URE: f̂_c(x)",
+  "Combined λ₂ (Row-Specific): f̂_c2(x)",
+  "Combined MM2: ψ̂_MM2(x)"
+)
+plot_df_all$Method <- factor(plot_df_all$Method, levels = desired_levels)
+
+# Common breaks across all panels
+all_vals <- plot_df_all$CATE
+xmin <- min(all_vals, na.rm = TRUE)
+xmax <- max(all_vals, na.rm = TRUE)
+nbins <- 50
+breaks_common <- seq(xmin, xmax, length.out = nbins + 1)
+
+# Optional: dynamic y-limit so bars aren’t cut off (compute max count)
+get_counts <- function(x, brks) hist(x, breaks = brks, plot = FALSE)$counts
+ymax <- max(sapply(split(plot_df_all$CATE, plot_df_all$Method),
+                   get_counts, brks = breaks_common), na.rm = TRUE)
+
+ggplot(plot_df_all, aes(x = CATE)) +
+  geom_histogram(breaks = breaks_common, color = "white") +
+  facet_wrap(~ Method, ncol = 3, scales = "fixed") +
+  coord_cartesian(xlim = c(xmin, xmax), ylim = c(0, ymax * 1.05)) +
+  labs(x = "Effect Size", y = "Count") +
+  theme_minimal(base_size = 12)
+```
+
+```{r}
+# ===== CHUNK 3b: summaries (fixed) =====
+library(dplyr)
+
+# Use the same mask from Chunk 3
+idx <- if (exists("idx")) idx else which(mask_shrink)
+
+# Masked vectors
+fo_m  <- f_o_hat[idx]
+fr_m  <- f_r_hat[idx]
+mm1_m <- psi_MM1
+mm2_m <- psi_MM2
+fc_m  <- if (exists("f_combined"))  f_combined[idx]  else NULL
+fc2_m <- if (exists("f_combined2")) f_combined2[idx] else NULL
+
+summ_one <- function(x, label, fr = fr_m, fo = fo_m) {
+  data.frame(
+    Method             = label,
+    N                  = sum(is.finite(x)),
+    Mean               = mean(x, na.rm = TRUE),
+    SD                 = sd(x, na.rm = TRUE),
+    P5                 = as.numeric(quantile(x, 0.05, na.rm = TRUE, names = FALSE)),
+    Median             = median(x, na.rm = TRUE),
+    P95                = as.numeric(quantile(x, 0.95, na.rm = TRUE, names = FALSE)),
+    Min                = min(x, na.rm = TRUE),
+    Max                = max(x, na.rm = TRUE),
+    L1_MAE             = mean(abs(x), na.rm = TRUE),
+    L2_Norm            = sqrt(sum(x^2, na.rm = TRUE)),
+    Cor_with_RCT       = suppressWarnings(cor(x, fr, use = "complete.obs")),
+    Cor_with_OBS       = suppressWarnings(cor(x, fo, use = "complete.obs")),
+    RMSE_vs_RCT        = sqrt(mean((x - fr)^2, na.rm = TRUE)),
+    RMSE_vs_OBS        = sqrt(mean((x - fo)^2, na.rm = TRUE)),
+    Prop_abs_x_lt_1e4  = mean(abs(x) < 1e-4, na.rm = TRUE),
+    stringsAsFactors   = FALSE
+  )
+}
+
+rows <- list(
+  summ_one(fo_m,  "OBS: f̂_o(x)"),
+  summ_one(fr_m,  "RCT: f̂_r(x)"),
+  if (!is.null(fc_m))  summ_one(fc_m,  "Combined λ_URE: f̂_c(x)"),
+  if (!is.null(fc2_m)) summ_one(fc2_m, "Combined λ₂ (Row-Specific): f̂_c2(x)"),
+  summ_one(mm1_m, "Combined MM1: ψ̂_MM1(x)"),
+  summ_one(mm2_m, "Combined MM2: ψ̂_MM2(x)")
+)
+
+sum_comb <- bind_rows(Filter(Negate(is.null), rows)) %>%
+  arrange(factor(Method, levels = c(
+    "OBS: f̂_o(x)", "RCT: f̂_r(x)",
+    "Combined λ_URE: f̂_c(x)", "Combined λ₂ (Row-Specific): f̂_c2(x)",
+    "Combined MM1: ψ̂_MM1(x)", "Combined MM2: ψ̂_MM2(x)"
+  )))
+
+sum_weights <- data.frame(
+  eta2_mm      = eta2,
+  gamma2_mm1   = gamma2_1,
+  gamma2_mm2   = gamma2_2,
+  mean_lambda1 = mean(lam1, na.rm = TRUE),
+  sd_lambda1   = sd(lam1, na.rm = TRUE),
+  mean_lambda2 = mean(lam2, na.rm = TRUE),
+  sd_lambda2   = sd(lam2, na.rm = TRUE),
+  mean_a1      = mean(a1,  na.rm = TRUE),
+  sd_a1        = sd(a1,    na.rm = TRUE),
+  mean_a2      = mean(a2,  na.rm = TRUE),
+  sd_a2        = sd(a2,    na.rm = TRUE)
+)
+
+print(sum_comb, row.names = FALSE)
+print(sum_weights, row.names = FALSE)
+
+# save one csv with the main summaries
+out_dir <- if (requireNamespace("here", quietly = TRUE)) here::here("outputs") else "outputs"
+if (!dir.exists(out_dir)) dir.create(out_dir, recursive = TRUE)
+fn_stats <- file.path(out_dir, "output_stats_summary.csv")
+write.csv(sum_comb, fn_stats, row.names = FALSE)
+cat("Saved:", fn_stats, "\n")
+```
+
+```{r}
+# ==========================================================
+# Ensure alignment & attach estimator columns to rct_data
+# (uses your cleaning; no extra binning added)
+# ==========================================================
+library(dplyr); library(tidyr); library(ggplot2)
+
+# 1) Align to rct_row_id and attach mask
+if (!"ROW_ID" %in% names(rct_data) && exists("rct_row_id")) rct_data$ROW_ID <- rct_row_id
+if (exists("rct_row_id")) {
+  stopifnot(length(rct_row_id) == nrow(rct_data))
+  if (!identical(rct_data$ROW_ID, rct_row_id)) {
+    ord <- match(rct_row_id, rct_data$ROW_ID); stopifnot(!any(is.na(ord)))
+    rct_data <- rct_data[ord, , drop = FALSE]
+  }
+}
+stopifnot(exists("mask_shrink")); rct_data$mask_shrink <- mask_shrink
+
+# 2) Attach estimator columns (full length; NA outside mask is fine)
+need_vecs <- c("f_r_hat","var_r_hat","f_o_hat","f_combined","f_combined2")
+for (nm in need_vecs) if (!exists(nm)) assign(nm, rep(NA_real_, nrow(rct_data)))
+
+rct_data <- rct_data %>%
+  mutate(
+    f_r_hat     = f_r_hat,
+    var_r_hat   = var_r_hat,
+    f_o_hat     = f_o_hat,
+    f_combined  = f_combined,     # λ_URE scalar combiner
+    f_combined2 = f_combined2     # λ₂ row-specific combiner
+  )
+
+# 3) Join MM outputs for masked rows only (type-safe key)
+stopifnot(exists("idx"), exists("psi_MM1"), exists("psi_MM2"))
+mm_join <- data.frame(ROW_ID = rct_row_id[idx], psi_MM1 = psi_MM1, psi_MM2 = psi_MM2)
+if (!inherits(rct_data$ROW_ID, class(mm_join$ROW_ID))) {
+  rct_data$ROW_ID <- as.character(rct_data$ROW_ID)
+  mm_join$ROW_ID  <- as.character(mm_join$ROW_ID)
+}
+rct_data <- dplyr::left_join(rct_data, mm_join, by = "ROW_ID")
+
+# 4) Subgroup factors — ONLY those defined by your cleaning / original Step 2
+#    Create MENO_CAT / BMI_CAT *only if missing*; otherwise just drop unused levels.
+#    (AGE_CAT came from Chunk 1 cleaning; keep as-is.)
+if ("AGE_CAT" %in% names(rct_data) && is.factor(rct_data$AGE_CAT)) {
+  rct_data$AGE_CAT <- droplevels(rct_data$AGE_CAT)
+}
+
+if (!"MENO_CAT" %in% names(rct_data)) {
+  rct_data$MENO_CAT <- cut(
+    rct_data$MENO_YRS,
+    breaks = c(0, 40, 45, 50, 55, Inf),
+    labels = c("≤40","41–45","46–50","51–55","56+"),
+    right = TRUE
+  )
+} else if (is.factor(rct_data$MENO_CAT)) {
+  rct_data$MENO_CAT <- droplevels(rct_data$MENO_CAT)
+}
+
+if (!"BMI_CAT" %in% names(rct_data)) {
+  rct_data$BMI_CAT <- cut(
+    rct_data$BMI,
+    breaks = c(0, 18.5, 25, 30, 35, Inf),
+    labels = c("Underweight","Normal","Overweight","Obese I","Obese II+"),
+    right = FALSE
+  )
+} else if (is.factor(rct_data$BMI_CAT)) {
+  rct_data$BMI_CAT <- droplevels(rct_data$BMI_CAT)
+}
+
+# These were factors in your cleaning; just drop unused levels if present
+for (v in c("SMOKING","ETHNIC_GRP","HOTFLASH")) {
+  if (v %in% names(rct_data) && is.factor(rct_data[[v]])) {
+    rct_data[[v]] <- droplevels(rct_data[[v]])
+  }
+}
+
+# Label for plotting ONLY; does not modify numeric OSTEOPOR
+if ("OSTEOPOR" %in% names(rct_data)) {
+  rct_data$OSTEOPOR_F <- factor(
+    ifelse(is.na(rct_data$OSTEOPOR), NA, ifelse(rct_data$OSTEOPOR == 1, "Yes", "No")),
+    levels = c("No","Yes")
+  )
+}
+
+# ==========================================================
+# Six-panel subgroup plot (OBS, RCT, MM1, λ_URE, λ₂, MM2)
+# ==========================================================
+plot_CATE_by_group6 <- function(data, group_var, y_limits = c(-0.1, 0.1), title_suffix = "") {
+  stopifnot(group_var %in% names(data))  # subgroup must exist
+  data_use <- data %>%
+    dplyr::filter(mask_shrink) %>%
+    dplyr::filter(!is.na(f_o_hat), !is.na(f_r_hat))
+
+  data_use[[group_var]] <- droplevels(as.factor(data_use[[group_var]]))
+
+  have_cols <- intersect(c("f_o_hat","f_r_hat","psi_MM1","f_combined","f_combined2","psi_MM2"),
+                         names(data_use))
+
+  df_long <- data_use %>%
+    dplyr::select(all_of(group_var), all_of(have_cols)) %>%
+    tidyr::pivot_longer(cols = all_of(have_cols), names_to = "Model", values_to = "CATE") %>%
+    dplyr::mutate(Model = dplyr::recode(Model,
+      f_o_hat     = "OBS: f̂_o(x)",
+      f_r_hat     = "RCT: f̂_r(x)",
+      psi_MM1     = "Combined MM1: ψ̂_MM1(x)",
+      f_combined  = "Combined λ_URE: f̂_c(x)",
+      f_combined2 = "Combined λ₂ (Row-Specific): f̂_c2(x)",
+      psi_MM2     = "Combined MM2: ψ̂_MM2(x)"
+    ))
+
+  desired_levels <- c(
+    "OBS: f̂_o(x)", "RCT: f̂_r(x)", "Combined MM1: ψ̂_MM1(x)",
+    "Combined λ_URE: f̂_c(x)", "Combined λ₂ (Row-Specific): f̂_c2(x)",
+    "Combined MM2: ψ̂_MM2(x)"
+  )
+  df_long$Model <- factor(df_long$Model, levels = desired_levels)
+
+  ggplot(df_long, aes(x = .data[[group_var]], y = CATE)) +
+    geom_boxplot(outlier.alpha = 0.15) +
+    geom_hline(yintercept = 0, linetype = "dashed", color = "gray40") +
+    facet_wrap(~ Model, ncol = 3, scales = "fixed") +
+    coord_cartesian(ylim = y_limits) +
+    labs(title = paste("CATE by", group_var, title_suffix),
+         x = group_var, y = "CATE") +
+    theme_minimal(base_size = 13) +
+    theme(legend.position = "none",
+          axis.text.x = element_text(angle = 0, hjust = 0.5))
+}
+
+# ==========================================================
+# Generate & SAVE separate figures (ONLY for your defined covariates)
+# ==========================================================
+out_dir <- "outputs/plots"
+if (!dir.exists(out_dir)) dir.create(out_dir, recursive = TRUE)
+
+plots <- list(
+  AGE_CAT   = plot_CATE_by_group6(rct_data, "AGE_CAT",   y_limits = c(-0.1, 0.1), title_suffix = " (Age)"),
+  MENO_CAT  = plot_CATE_by_group6(rct_data, "MENO_CAT",  y_limits = c(-0.1, 0.1), title_suffix = " (Menopause age)"),
+  BMI_CAT   = plot_CATE_by_group6(rct_data, "BMI_CAT",   y_limits = c(-0.1, 0.1), title_suffix = " (BMI)"),
+  SMOKING   = plot_CATE_by_group6(rct_data, "SMOKING",   y_limits = c(-0.1, 0.1), title_suffix = " (Smoking)"),
+  ETHNIC    = plot_CATE_by_group6(rct_data, "ETHNIC_GRP",y_limits = c(-0.1, 0.1), title_suffix = " (Ethnicity)"),
+  HOTFLASH  = plot_CATE_by_group6(rct_data, "HOTFLASH",  y_limits = c(-0.1, 0.1), title_suffix = " (Hot flash)"),
+  OSTEOPOR  = plot_CATE_by_group6(rct_data, "OSTEOPOR_F",y_limits = c(-0.1, 0.1), title_suffix = " (Osteoporosis)")
+)
+
+for (nm in names(plots)) {
+  fn <- file.path(out_dir, paste0("cate_by_", tolower(nm), ".png"))
+  ggsave(filename = fn, plot = plots[[nm]], width = 10, height = 6, dpi = 300)
+  message("Saved: ", fn)
+}
+
+# Optionally preview two
+print(plots$MENO_CAT)
+print(plots$BMI_CAT)
+
+```
+
+```{r}
+# ---- Load libraries ----
+library(ggplot2)
+library(tidyr)
+library(dplyr)
+
+# ---- Build plotting dataframe ----
+plot_df <- data.frame(
+  CATE = c(f_r_hat, f_o_hat, f_combined, f_combined2),
+  Method = factor(rep(c("RCT: f̂_r(x)", "OBS: f̂_o(x)", 
+                        "Combined λ_URE: f̂_c(x)", 
+                        "Combined λ₂ (Row-Specific): f̂_c2(x)"), 
+                      each = length(f_r_hat)))
+)
+
+# ---- Set global axis ranges ----
+xrange <- range(f_r_hat, f_o_hat, f_combined)
+ylim_fixed <- c(0, 4000)
+
+# ---- Plot all 4 histograms in 2×2 layout ----
+ggplot(plot_df, aes(x = CATE)) +
+  geom_histogram(bins = 50, fill = "skyblue", color = "white") +
+  facet_wrap(~ Method, ncol = 2, scales = "fixed") +
+  coord_cartesian(xlim = xrange, ylim = ylim_fixed) +
+  labs(x = "Effect Size", y = "Count") +
+  theme_minimal(base_size = 12)
+
+# ---- 1×3 Layout for First Three Only with Custom Means ----
+plot_df_sub <- plot_df %>%
+  filter(Method %in% c("OBS: f̂_o(x)", "RCT: f̂_r(x)", "Combined λ_URE: f̂_c(x)")) %>%
+  mutate(Method = factor(Method, levels = c("OBS: f̂_o(x)", "RCT: f̂_r(x)", "Combined λ_URE: f̂_c(x)")))
+
+means <- plot_df_sub %>%
+  group_by(Method) %>%
+  summarise(mu = mean(CATE), .groups = "drop") %>%
+  mutate(label = sprintf("%s\nMean = %.5f", Method, mu))
+
+ggplot(plot_df_sub, aes(x = CATE, fill = Method)) +
+  geom_histogram(bins = 40, color = "white") +
+  facet_wrap(~ Method, nrow = 1, scales = "fixed", 
+             labeller = as_labeller(setNames(as.character(means$label), as.character(means$Method)))) +
+  coord_cartesian(xlim = xrange, ylim = ylim_fixed) +
+  scale_fill_manual(values = c(
+    "OBS: f̂_o(x)" = "#81b1d2",
+    "RCT: f̂_r(x)" = "#b2cba8",
+    "Combined λ_URE: f̂_c(x)" = "#d4a6c8"
+  )) +
+  guides(fill = "none") +
+  labs(x = "Effect Size", y = "Count") +
+  theme_minimal(base_size = 12)
+
+```
+
+## OLD GRAPHS BELOW, IGNORE \_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_
+
+```{r}
+# ---- Load libraries ----
+library(ggplot2)
+library(tidyr)
+library(dplyr)
+library(patchwork)  # For combining plots cleanly
+
+# ---- Step 0: Base RCT data ----
+rct_df <- rct0
+
+# ---- Step 1: Attach all estimates explicitly ----
+stopifnot(nrow(rct_df) == length(f_combined))  # Sanity check
+
+rct_df$f_combined <- as.numeric(f_combined)
+rct_df$f_o_hat    <- as.numeric(f_o_hat)
+rct_df$f_r_hat    <- as.numeric(f_r_hat)
+
+# ---- Step 2: Create AGE_CAT factor from AGE if needed ----
+if (!("AGE_CAT" %in% names(rct_df)) || !is.factor(rct_df$AGE_CAT)) {
+  rct_df$AGE_CAT <- cut(
+    rct_df$AGE,
+    breaks = c(49, 54, 59, 64, 69, 74, 79, Inf),
+    labels = c("50–54", "55–59", "60–64", "65–69", "70–74", "75–79"),
+    right = TRUE
+  )
+}
+
+# Ensure AGE_CAT is ordered factor
+rct_df$AGE_CAT <- factor(
+  rct_df$AGE_CAT,
+  levels = c("50–54", "55–59", "60–64", "65–69", "70–74", "75–79"),
+  ordered = TRUE
+)
+
+# ---- Step 3: Pivot to long format for ggplot ----
+rct_long <- rct_df %>%
+  dplyr::select(AGE_CAT, ETHNIC_GRP, MENO_YRS, f_combined, f_o_hat, f_r_hat) %>%
+  pivot_longer(
+    cols = starts_with("f_"),
+    names_to = "Model",
+    values_to = "CATE"
+  )
+
+# ---- Step 4: Convert CATE to numeric (for safety) ----
+rct_long$CATE <- as.numeric(rct_long$CATE)
+
+# ---- Step 5: Rename model labels for clarity ----
+rct_long$Model <- recode(rct_long$Model,
+                         f_combined = "Combined",
+                         f_o_hat = "Observational",
+                         f_r_hat = "RCT")
+
+# ---- Step 6: Plot function (applied to each model) ----
+make_boxplot <- function(model_name) {
+  ggplot(filter(rct_long, Model == model_name),
+         aes(x = AGE_CAT, y = CATE, fill = AGE_CAT)) +
+    geom_boxplot(outlier.alpha = 0.15) +
+    geom_hline(yintercept = 0, linetype = "dashed", color = "gray40") +
+    scale_fill_brewer(palette = "Dark2") +
+    ylim(-0.1, 0.1) +
+    labs(title = paste(model_name, "Estimate"), x = "Age Category", y = "CATE") +
+    theme_minimal(base_size = 13) +
+    theme(legend.position = "none")
+}
+
+# ---- Step 7: Generate each plot ----
+p_combined <- make_boxplot("Combined")
+p_obs      <- make_boxplot("Observational")
+p_rct      <- make_boxplot("RCT")
+
+# ---- Step 8: Display all together vertically ----
+p_combined / p_obs / p_rct
+
+
+
+```
+
+```{r}
+# ---- Step 6: Build cleaner faceted plot (1x3) ----
+# counts per age bin for axis labels
+age_counts <- rct_df %>%
+  count(AGE_CAT, name = "n") %>%
+  mutate(label = paste0(as.character(AGE_CAT), "\n(n=", n, ")"))
+
+# named vector for scale_x_discrete()
+age_labs <- setNames(age_counts$label, age_counts$AGE_CAT)
+
+# order model facets left→right
+rct_long$Model <- factor(rct_long$Model,
+                         levels = c("Combined", "Observational", "RCT"))
+
+# keep only finite values (avoids warnings)
+rct_long <- rct_long %>% filter(is.finite(CATE))
+
+p <- ggplot(rct_long, aes(x = AGE_CAT, y = CATE)) +
+  # boxplots with neutral styling
+  geom_boxplot(width = 0.6, outlier.alpha = 0.15, fill = "grey85", color = "grey35") +
+  # show subgroup mean on top of the box
+  stat_summary(fun = mean, geom = "point", size = 1.8, shape = 21,
+               fill = "white", color = "black") +
+  # zero line
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey40") +
+  # consistent axes and layout
+  facet_wrap(~ Model, ncol = 3, scales = "fixed") +
+  scale_x_discrete(labels = age_labs) +
+  coord_cartesian(ylim = c(-0.10, 0.10)) +
+  labs(title = "CATE Estimates by Age Category",
+       x = "Age Category", y = "CATE") +
+  theme_minimal(base_size = 14) +
+  theme(
+    panel.grid.minor = element_blank(),
+    strip.text = element_text(face = "bold"),
+    axis.text.x = element_text(lineheight = 0.9),
+    plot.title = element_text(face = "bold"),
+    plot.margin = margin(10, 12, 10, 12)
+  )
+
+# ---- Step 7: Print or save ----
+print(p)
+# ggsave("cate_age_1x3.png", p, width = 12, height = 4.6, dpi = 300)
+
+```
+
+```{r}
+# ---- Step 6: Build cleaner faceted plot (1x3) ----
+age_counts <- rct_df %>%
+  count(AGE_CAT, name = "n") %>%
+  mutate(label = paste0(as.character(AGE_CAT), "\n(n=", n, ")"))
+age_labs <- setNames(age_counts$label, age_counts$AGE_CAT)
+
+rct_long$Model <- factor(rct_long$Model, levels = c("Combined", "Observational", "RCT"))
+rct_long <- rct_long %>% filter(is.finite(CATE))
+
+p <- ggplot(rct_long, aes(x = AGE_CAT, y = CATE)) +
+  geom_boxplot(width = 0.6,
+               outlier.shape = 16, outlier.size = 0.6, outlier.alpha = 0.20,
+               fill = "grey85", color = "grey35") +
+  stat_summary(fun = mean, geom = "point", size = 1.8, shape = 21,
+               fill = "white", color = "black") +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey40") +
+  facet_wrap(~ Model, ncol = 3, scales = "fixed") +
+  scale_x_discrete(labels = age_labs, guide = guide_axis(n.dodge = 2)) +  # less overlap
+  coord_cartesian(ylim = c(-0.10, 0.10)) +
+  labs(title = "CATE Estimates by Age Category",
+       x = "Age Category", y = "CATE") +
+  theme_minimal(base_size = 14) +
+  theme(
+    panel.grid.minor = element_blank(),
+    panel.grid.major.x = element_blank(),                    # cleaner background
+    strip.text = element_text(face = "bold"),
+    axis.text.x = element_text(size = 10, lineheight = 0.95, # fits labels better
+                               margin = margin(t = 4)),
+    axis.title.x = element_text(margin = margin(t = 8)),
+    plot.title = element_text(face = "bold"),
+    plot.margin = margin(10, 12, 10, 12),
+    panel.spacing.x = grid::unit(12, "pt")                   # a touch more facet spacing
+  )
+
+# ---- Step 7: Print or save ----
+print(p)
+# For slides/paper, save wider to prevent label wrap:
+# ggsave("cate_age_1x3.png", p, width = 13, height = 5, dpi = 300)
+
+```
+
+```{r}
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+
+# rct_df and rct_long already built in your code up to Step 5
+
+# --- Small robustness + labels ---
+rct_long <- rct_long %>%
+  filter(!is.na(AGE_CAT), is.finite(CATE)) %>%                # avoid warnings/empties
+  mutate(Model = factor(Model,
+                        levels = c("Combined (λ₁)", "Combined (λ₂)",
+                                   "Observational", "RCT")))
+
+age_counts <- rct_df %>%
+  count(AGE_CAT, name = "n") %>%
+  mutate(lbl = paste0(as.character(AGE_CAT), "\n(n=", n, ")"))
+age_labs <- setNames(age_counts$lbl, age_counts$AGE_CAT)
+
+# symmetric y-limits from central 99% of all values (prevents single outliers from blowing up axis)
+lim <- quantile(rct_long$CATE, c(0.005, 0.995), na.rm = TRUE)
+ylim_sym <- max(abs(lim))
+y_limits <- c(-ylim_sym, ylim_sym)
+
+# --- Plot (minimal changes to your original) ---
+p <- ggplot(rct_long, aes(x = AGE_CAT, y = CATE)) +
+  geom_boxplot(width = 0.55,
+               fill = "grey85", color = "grey35",
+               outlier.shape = 16, outlier.size = 0.6, outlier.alpha = 0.18) +
+  stat_summary(fun = mean, geom = "point", size = 1.8, shape = 21,
+               fill = "white", color = "black") +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey40") +
+  facet_wrap(~ Model, ncol = 1, drop = FALSE) +
+  scale_x_discrete(labels = age_labs, guide = guide_axis(n.dodge = 2)) +
+  coord_cartesian(ylim = y_limits) +
+  labs(title = "CATE Estimates by Age Category and Model",
+       x = "Age Category", y = "CATE") +
+  theme_minimal(base_size = 14) +
+  theme(
+    legend.position = "none",
+    strip.text = element_text(size = 14, face = "bold"),
+    panel.grid.minor = element_blank(),
+    panel.grid.major.x = element_blank(),
+    axis.text.x = element_text(size = 10, lineheight = 0.95, margin = margin(t = 4)),
+    axis.title.x = element_text(margin = margin(t = 8)),
+    plot.title = element_text(face = "bold"),
+    panel.spacing.y = grid::unit(10, "pt")   # a bit more space between rows
+  )
+
+print(p)
+# For slides/paper (taller figure so labels don't wrap):
+# ggsave("cate_age_models_1x4.png", p, width = 8, height = 10, dpi = 300)
+
+```
+
+```{r}
+# ---- Load libraries ----
+library(ggplot2)
+library(tidyr)
+library(dplyr)
+
+# ---- Step 0: Base RCT data ----
+rct_df <- rct0
+
+# ---- Step 1: Attach all estimates explicitly ----
+stopifnot(nrow(rct_df) == length(f_combined))      # Sanity check 1
+stopifnot(nrow(rct_df) == length(f_combined2))     # Sanity check 2
+
+rct_df$f_combined  <- as.numeric(f_combined)
+rct_df$f_combined2 <- as.numeric(f_combined2)
+rct_df$f_o_hat     <- as.numeric(f_o_hat)
+rct_df$f_r_hat     <- as.numeric(f_r_hat)
+
+# ---- Step 2: Create AGE_CAT factor from AGE if needed ----
+if (!("AGE_CAT" %in% names(rct_df)) || !is.factor(rct_df$AGE_CAT)) {
+  rct_df$AGE_CAT <- cut(
+    rct_df$AGE,
+    breaks = c(49, 54, 59, 64, 69, 74, 79, Inf),
+    labels = c("50–54", "55–59", "60–64", "65–69", "70–74", "75–79"),
+    right = TRUE
+  )
+}
+
+# Ensure AGE_CAT is ordered factor
+rct_df$AGE_CAT <- factor(
+  rct_df$AGE_CAT,
+  levels = c("50–54", "55–59", "60–64", "65–69", "70–74", "75–79"),
+  ordered = TRUE
+)
+
+# ---- Step 3: Pivot to long format for ggplot ----
+rct_long <- rct_df %>%
+  dplyr::select(AGE_CAT, ETHNIC_GRP, MENO_YRS,
+                f_combined, f_combined2, f_o_hat, f_r_hat) %>%
+  pivot_longer(
+    cols = starts_with("f_"),
+    names_to = "Model",
+    values_to = "CATE"
+  )
+
+# ---- Step 4: Convert CATE to numeric (for safety) ----
+rct_long$CATE <- as.numeric(rct_long$CATE)
+
+# ---- Step 5: Rename model labels for clarity ----
+rct_long$Model <- recode(rct_long$Model,
+                         f_combined  = "Combined (λ₁)",
+                         f_combined2 = "Combined (λ₂)",
+                         f_o_hat     = "Observational",
+                         f_r_hat     = "RCT")
+
+# ---- Step 6: Create combined boxplot using facet_wrap ----
+ggplot(rct_long, aes(x = AGE_CAT, y = CATE, fill = AGE_CAT)) +
+  geom_boxplot(outlier.alpha = 0.2, width = 0.5) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "gray40") +
+  facet_wrap(~Model, ncol = 1, scales = "fixed") +
+  scale_fill_brewer(palette = "Dark2") +
+  coord_cartesian(ylim = c(-0.12, 0.12)) +
+  labs(
+    title = "CATE Estimates by Age Category and Model",
+    x = "Age Category",
+    y = "CATE"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    legend.position = "none",
+    strip.text = element_text(size = 14, face = "bold"),
+    axis.text.x = element_text(size = 11),
+    axis.title.y = element_text(size = 12)
+  )
+
+```
+
+```{r}
+# build labels with (n=) once
+age_counts <- rct_df %>% count(AGE_CAT, name = "n") %>%
+  mutate(lbl = paste0(as.character(AGE_CAT), " (n=", n, ")"))
+rct_long <- rct_long %>% left_join(age_counts, by = "AGE_CAT") %>%
+  mutate(AGE_LAB = factor(lbl, levels = age_counts$lbl))
+
+p <- ggplot(rct_long, aes(y = AGE_LAB, x = CATE)) +     # ← flipped mapping
+  geom_boxplot(height = 0.55, fill = "grey85", color = "grey35",
+               outlier.shape = 16, outlier.size = 0.6, outlier.alpha = 0.18) +
+  stat_summary(fun = mean, geom = "point", size = 1.8, shape = 21,
+               fill = "white", color = "black") +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "grey40") +
+  facet_wrap(~ Model, ncol = 2) +
+  coord_cartesian(xlim = y_limits) +
+  labs(title = "CATE Estimates by Age Category and Model",
+       x = "CATE", y = "Age Category") +
+  theme_minimal(base_size = 14) +
+  theme(panel.grid.minor = element_blank(),
+        panel.grid.major.y = element_blank(),
+        strip.text = element_text(face = "bold"),
+        panel.spacing = grid::unit(12, "pt"))
+print(p)
+# ggsave("cate_age_models_flip.png", p, width = 11, height = 7.5, dpi = 300)
+
+```
+
+```{r}
+sum_df <- rct_long %>%
+  group_by(Model, AGE_CAT) %>%
+  summarise(n = n(),
+            mean = mean(CATE),
+            se   = sd(CATE)/sqrt(n),
+            lo   = mean - 1.96*se,
+            hi   = mean + 1.96*se,
+            .groups = "drop") %>%
+  left_join(age_counts, by = "AGE_CAT") %>%
+  mutate(AGE_LAB = factor(lbl, levels = age_counts$lbl))
+
+p <- ggplot(sum_df, aes(x = AGE_LAB, y = mean)) +
+  geom_pointrange(aes(ymin = lo, ymax = hi), size = 0.5) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey40") +
+  facet_wrap(~ Model, ncol = 2) +
+  coord_cartesian(ylim = y_limits) +
+  labs(title = "CATE (mean ± 95% CI) by Age Category and Model",
+       x = "Age Category", y = "CATE") +
+  theme_minimal(base_size = 14) +
+  theme(panel.grid.minor = element_blank(),
+        strip.text = element_text(face = "bold"),
+        axis.text.x = element_text(size = 10, lineheight = 0.95, margin = margin(t = 4)),
+        panel.spacing = grid::unit(12, "pt"))
+print(p)
+# ggsave("cate_age_models_ci.png", p, width = 11, height = 6.5, dpi = 300)
+
+```
+
+```{r}
+# ---- Load libraries ----
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+
+# ---- Step 1: Construct new data frame manually ----
+stopifnot(nrow(rct0) == length(f_combined))  # Sanity check
+
+rct_df <- rct0
+
+# Add the CATE columns explicitly and force numeric
+rct_df$f_combined <- as.numeric(f_combined)
+rct_df$f_o_hat    <- as.numeric(f_o_hat)
+rct_df$f_r_hat    <- as.numeric(f_r_hat)
+
+# ---- Step 2: Confirm data types before plotting ----
+str(rct_df$f_combined)   # Must show: num
+str(rct_df$AGE_CAT)      # Should show: Ord.factor or chr
+
+# ---- Step 3: Fix AGE_CAT if needed ----
+if (!("factor" %in% class(rct_df$AGE_CAT))) {
+  rct_df$AGE_CAT <- cut(
+    rct_df$AGE,
+    breaks = c(49, 54, 59, 64, 69, 74, 79, Inf),
+    labels = c("50–54", "55–59", "60–64", "65–69", "70–74", "75–79"),
+    right = TRUE
+  )
+}
+rct_df$AGE_CAT <- factor(
+  rct_df$AGE_CAT,
+  levels = c("50–54", "55–59", "60–64", "65–69", "70–74", "75–79"),
+  ordered = TRUE
+)
+
+# ---- Step 4: Simple test plot with raw ggplot ----
+ggplot(rct_df, aes(x = AGE_CAT, y = f_combined, fill = AGE_CAT)) +
+  geom_boxplot(outlier.alpha = 0.2) +
+  labs(title = "Test: Combined CATE by Age", x = "Age Group", y = "CATE") +
+  theme_minimal() +
+  theme(legend.position = "none")
+
+```
+
+```{r}
+# ==========================================================
+# STEP 1: Merge CATEs with rct_data
+# ==========================================================
+rct_data <- rct_data %>%
+  mutate(
+    f_r_hat      = f_r_hat,
+    f_o_hat      = f_o_hat,
+    f_combined   = f_combined,    # λ1 shrinkage
+    f_combined2  = f_combined2    # λ2 shrinkage (newly added)
+  )
+
+# ==========================================================
+# STEP 2: Define Subgroup Variables (corrected bins)
+# ==========================================================
+rct_data <- rct_data %>%
+  mutate(
+    # Menopause Age bin (corrected!)
+    MENO_CAT = cut(
+      MENO_YRS,
+      breaks = c(0, 40, 45, 50, 55, Inf),
+      labels = c("≤40", "41–45", "46–50", "51–55", "56+"),
+      right = TRUE
+    ),
+
+    # BMI bin (unchanged)
+    BMI_CAT = cut(
+      BMI,
+      breaks = c(0, 18.5, 25, 30, 35, Inf),
+      labels = c("Underweight", "Normal", "Overweight", "Obese I", "Obese II+"),
+      right = FALSE
+    )
+  )
+
+# ==========================================================
+# STEP 3: Load Required Libraries
+# ==========================================================
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+library(patchwork)
+
+# ==========================================================
+# STEP 4: Define Plotting Function for 4 Estimators
+# ==========================================================
+plot_CATE_by_group <- function(data, group_var, y_limits = c(-0.1, 0.1), title_suffix = "") {
+  df_long <- data %>%
+    dplyr::select(all_of(group_var), f_combined, f_combined2, f_o_hat, f_r_hat) %>%
+    pivot_longer(cols = starts_with("f_"), names_to = "Model", values_to = "CATE") %>%
+    mutate(Model = recode(Model,
+                          f_combined   = "Combined (λ₁)",
+                          f_combined2  = "Combined (λ₂)",
+                          f_o_hat      = "OBS",
+                          f_r_hat      = "RCT"))
+
+  df_long[[group_var]] <- as.factor(df_long[[group_var]])
+
+  plot <- ggplot(df_long, aes(x = .data[[group_var]], y = CATE, fill = Model)) +
+    geom_boxplot(outlier.alpha = 0.15) +
+    geom_hline(yintercept = 0, linetype = "dashed", color = "gray40") +
+    facet_wrap(~Model, ncol = 2) +
+    labs(title = paste("CATE Estimates by", group_var, title_suffix),
+         x = group_var, y = "CATE") +
+    ylim(y_limits) +
+    theme_minimal(base_size = 13) +
+    theme(legend.position = "none")
+
+  return(plot)
+}
+
+# ==========================================================
+# STEP 5: Example Run
+# ==========================================================
+plot_CATE_by_group(rct_data, "MENO_CAT")
+```
+
+```{r}
+# ---- Load libraries ----
+library(ggplot2)
+library(tidyr)
+library(dplyr)
+
+# ---- Step 0: Start from rct_df with predictions ----
+rct_df <- rct0  # Already cleaned
+
+# Attach predictions if not yet attached
+stopifnot(nrow(rct_df) == length(f_combined))
+rct_df$f_combined  <- as.numeric(f_combined)
+rct_df$f_combined2 <- as.numeric(f_combined2)
+rct_df$f_o_hat     <- as.numeric(f_o_hat)
+rct_df$f_r_hat     <- as.numeric(f_r_hat)
+
+# ---- Step 1: Confirm ETHNIC_GRP is a factor with levels ----
+rct_df$ETHNIC_GRP <- factor(rct_df$ETHNIC_GRP,
+                            levels = c("White", "Black", "Hispanic", "Other"))
+
+# ---- Step 2: Pivot to long format for ggplot ----
+ethnic_long <- rct_df %>%
+  dplyr::select(ETHNIC_GRP, f_combined, f_combined2, f_o_hat, f_r_hat) %>%
+  pivot_longer(
+    cols = starts_with("f_"),
+    names_to = "Model",
+    values_to = "CATE"
+  )
+
+# ---- Step 3: Convert and relabel ----
+ethnic_long$CATE <- as.numeric(ethnic_long$CATE)
+ethnic_long$Model <- recode(ethnic_long$Model,
+                            f_combined  = "Combined (λ₁)",
+                            f_combined2 = "Combined (λ₂)",
+                            f_o_hat     = "Observational",
+                            f_r_hat     = "RCT")
+
+# ---- Step 3b: small cleanup + labels (adds no new data logic) ----
+ethnic_long <- ethnic_long %>%
+  filter(!is.na(ETHNIC_GRP), is.finite(CATE)) %>% 
+  mutate(Model = factor(Model,
+                        levels = c("Combined (λ₁)", "Combined (λ₂)",
+                                   "Observational", "RCT")))
+
+# (n=) labels for x-axis
+eth_counts <- rct_df %>% count(ETHNIC_GRP, name = "n")
+eth_labs <- setNames(
+  paste0(levels(rct_df$ETHNIC_GRP), "\n(n=", eth_counts$n[match(levels(rct_df$ETHNIC_GRP),
+                                                                as.character(eth_counts$ETHNIC_GRP))], ")"),
+  levels(rct_df$ETHNIC_GRP)
+)
+
+# ---- Step 4: Combined faceted boxplot ----
+ggplot(ethnic_long, aes(x = ETHNIC_GRP, y = CATE, fill = ETHNIC_GRP)) +
+  geom_boxplot(outlier.alpha = 0.2, width = 0.5) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "gray40") +
+  facet_wrap(~Model, ncol = 1, scales = "fixed") +
+  scale_fill_brewer(palette = "Set2") +
+  coord_cartesian(ylim = c(-0.12, 0.12)) +
+  labs(
+    title = "CATE Estimates by Ethnic Group and Model",
+    x = "Ethnic Group",
+    y = "CATE"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    legend.position = "none",
+    strip.text = element_text(size = 14, face = "bold"),
+    plot.title = element_text(size = 15, face = "bold", hjust = 0.5),
+    axis.title.y = element_text(size = 12),
+    axis.text.x = element_text(size = 11)
+  )
+
+```
+
+```{r}
+# ---- Load libraries ----
+library(ggplot2)
+library(tidyr)
+library(dplyr)
+
+# ---- Step 0: Start from rct_df with predictions ----
+rct_df <- rct0  # Already cleaned
+
+# Attach predictions if not yet attached
+stopifnot(nrow(rct_df) == length(f_combined))
+rct_df$f_combined  <- as.numeric(f_combined)
+rct_df$f_combined2 <- as.numeric(f_combined2)
+rct_df$f_o_hat     <- as.numeric(f_o_hat)
+rct_df$f_r_hat     <- as.numeric(f_r_hat)
+
+# ---- Step 1: Confirm ETHNIC_GRP is a factor with levels ----
+rct_df$ETHNIC_GRP <- factor(rct_df$ETHNIC_GRP,
+                            levels = c("White", "Black", "Hispanic", "Other"))
+
+# ---- Step 2: Pivot to long format for ggplot ----
+ethnic_long <- rct_df %>%
+  dplyr::select(ETHNIC_GRP, f_combined, f_combined2, f_o_hat, f_r_hat) %>%
+  pivot_longer(
+    cols = starts_with("f_"),
+    names_to = "Model",
+    values_to = "CATE"
+  )
+
+# ---- Step 3: Convert and relabel ----
+ethnic_long$CATE <- as.numeric(ethnic_long$CATE)
+ethnic_long$Model <- recode(ethnic_long$Model,
+                            f_combined  = "Combined (λ₁)",
+                            f_combined2 = "Combined (λ₂)",
+                            f_o_hat     = "Observational",
+                            f_r_hat     = "RCT")
+
+# ---- Step 3b: small cleanup + labels (adds no new data logic) ----
+ethnic_long <- ethnic_long %>%
+  filter(!is.na(ETHNIC_GRP), is.finite(CATE)) %>% 
+  mutate(Model = factor(Model,
+                        levels = c("Combined (λ₁)", "Combined (λ₂)",
+                                   "Observational", "RCT")))
+
+# (n=) labels for x-axis
+eth_counts <- rct_df %>% count(ETHNIC_GRP, name = "n")
+eth_labs <- setNames(
+  paste0(levels(rct_df$ETHNIC_GRP), "\n(n=", eth_counts$n[match(levels(rct_df$ETHNIC_GRP),
+                                                                as.character(eth_counts$ETHNIC_GRP))], ")"),
+  levels(rct_df$ETHNIC_GRP)
+)
+
+# ---- Step 4: Combined faceted boxplot (polished) ----
+p <- ggplot(ethnic_long, aes(x = ETHNIC_GRP, y = CATE, fill = ETHNIC_GRP)) +
+  geom_boxplot(width = 0.6,
+               color = "grey35",
+               outlier.shape = 16, outlier.size = 0.7, outlier.alpha = 0.18) +
+  stat_summary(fun = mean, geom = "point", size = 1.9, shape = 21,
+               fill = "white", color = "black") +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey40") +
+  facet_wrap(~ Model, ncol = 1, scales = "fixed") +     # same 1×4 layout
+  scale_fill_brewer(palette = "Set2") +
+  scale_x_discrete(labels = eth_labs) +                 # adds (n=) under group names
+  coord_cartesian(ylim = c(-0.12, 0.12)) +              # same range, no warnings
+  labs(
+    title = "CATE Estimates by Ethnic Group and Model",
+    x = "Ethnic Group",
+    y = "CATE"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    legend.position = "none",
+    strip.text = element_text(size = 14, face = "bold"),
+    panel.grid.minor = element_blank(),
+    panel.grid.major.x = element_blank(),
+    axis.text.x = element_text(size = 10, lineheight = 0.95, margin = margin(t = 4)),
+    axis.title.x = element_text(margin = margin(t = 8)),
+    plot.title = element_text(size = 16, face = "bold", hjust = 0.5),
+    panel.spacing.y = grid::unit(10, "pt")
+  )
+
+print(p)
+# ggsave("cate_ethnic_1x4.png", p, width = 8, height = 10, dpi = 300)  # taller save avoids label squeeze
+
+```
+
+```{r}
+# ---- Load libraries ----
+library(ggplot2)
+library(tidyr)
+library(dplyr)
+library(patchwork)
+
+# ---- Step 0: Base RCT data ----
+rct_df <- rct0  # already cleaned
+
+# Attach predictions
+stopifnot(nrow(rct_df) == length(f_combined))
+rct_df$f_combined  <- as.numeric(f_combined)
+rct_df$f_combined2 <- as.numeric(f_combined2)
+rct_df$f_o_hat     <- as.numeric(f_o_hat)
+rct_df$f_r_hat     <- as.numeric(f_r_hat)
+
+# ---- Step 1: Create BMI categories ----
+# WHO standard cutoffs: <18.5, 18.5–25, 25–30, 30+
+rct_df$BMI_CAT <- cut(
+  rct_df$BMI, 
+  breaks = c(-Inf, 18.5, 25, 30, Inf),
+  labels = c("Underweight", "Normal", "Overweight", "Obese"),
+  right = FALSE
+)
+
+# Optional: Order levels
+rct_df$BMI_CAT <- factor(
+  rct_df$BMI_CAT,
+  levels = c("Underweight", "Normal", "Overweight", "Obese"),
+  ordered = TRUE
+)
+
+# ---- Step 2: Pivot predictions to long format ----
+bmi_long <- rct_df %>%
+  dplyr::select(BMI_CAT, f_combined, f_combined2, f_o_hat, f_r_hat) %>%
+  pivot_longer(
+    cols = starts_with("f_"),
+    names_to = "Model",
+    values_to = "CATE"
+  )
+
+# ---- Step 3: Relabel and sanitize ----
+bmi_long$CATE <- as.numeric(bmi_long$CATE)
+bmi_long$Model <- recode(bmi_long$Model,
+                         f_combined  = "Combined (λ₁)",
+                         f_combined2 = "Combined (λ₂)",
+                         f_o_hat     = "Observational",
+                         f_r_hat     = "RCT")
+
+# ---- Step 3b: small cleanup + labels ----
+bmi_long <- bmi_long %>%
+  filter(!is.na(BMI_CAT), is.finite(CATE)) %>%
+  mutate(Model = factor(Model,
+                        levels = c("Combined (λ₁)", "Combined (λ₂)",
+                                   "Observational", "RCT")))
+
+# (n=) labels on x-axis
+bmi_counts <- rct_df %>% count(BMI_CAT, name = "n")
+bmi_labs <- setNames(
+  paste0(levels(rct_df$BMI_CAT), "\n(n=", bmi_counts$n[match(levels(rct_df$BMI_CAT),
+                                                             as.character(bmi_counts$BMI_CAT))], ")"),
+  levels(rct_df$BMI_CAT)
+)
+
+# optional: compute symmetric y-lims from central 99% (comment out to keep fixed range)
+lim <- quantile(bmi_long$CATE, c(0.005, 0.995), na.rm = TRUE)
+ylim_sym <- max(abs(lim))
+y_limits <- c(-ylim_sym, ylim_sym)
+# y_limits <- c(-0.12, 0.12)  # <-- use this instead if you prefer fixed
+
+
+# ---- Step 4: Combined faceted boxplot (polished, same layout) ----
+p <- ggplot(bmi_long, aes(x = BMI_CAT, y = CATE, fill = BMI_CAT)) +
+  geom_boxplot(width = 0.6,
+               color = "grey35",
+               outlier.shape = 16, outlier.size = 0.7, outlier.alpha = 0.18) +
+  stat_summary(fun = mean, geom = "point", size = 1.9, shape = 21,
+               fill = "white", color = "black") +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey40") +
+  facet_wrap(~ Model, ncol = 1, scales = "fixed") +     # same 1×4 stack
+  scale_fill_brewer(palette = "Pastel2") +
+  scale_x_discrete(labels = bmi_labs) +
+  coord_cartesian(ylim = y_limits) +
+  labs(title = "CATE Estimates by BMI Category and Model",
+       x = "BMI Category", y = "CATE") +
+  theme_minimal(base_size = 14) +
+  theme(
+    legend.position = "none",
+    strip.text = element_text(size = 14, face = "bold"),
+    panel.grid.minor = element_blank(),
+    panel.grid.major.x = element_blank(),
+    axis.text.x = element_text(size = 10, lineheight = 0.95, margin = margin(t = 4)),
+    axis.title.x = element_text(margin = margin(t = 8)),
+    plot.title = element_text(size = 16, face = "bold", hjust = 0.5),
+    panel.spacing.y = grid::unit(10, "pt")
+  )
+
+print(p)
+# ggsave("cate_bmi_1x4.png", p, width = 8, height = 10, dpi = 300)
+
+```
