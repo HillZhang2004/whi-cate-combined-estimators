@@ -392,6 +392,534 @@ ggplot(plot_df_all, aes(x = CATE)) +
 ```
 
 ```{r}
+# ==== Diagnostics Pre-flight (namespaced; no mutation) ====
+library(dplyr); library(tidyr); library(ggplot2)
+
+stopifnot(
+  exists("mask_shrink"), exists("rct_row_id"),
+  exists("rct_data"), "ROW_ID" %in% names(rct_data),
+  exists("f_r_hat"), exists("f_o_hat"),
+  exists("f_combined"), exists("f_combined2"),
+  exists("psi_MM1"), exists("psi_MM2")
+)
+
+diag_idx <- which(mask_shrink)
+stopifnot(length(diag_idx) > 0)
+
+# Align a COPY; do not mutate rct_data
+diag_rct_aligned <- {
+  if (!identical(rct_data$ROW_ID, rct_row_id)) {
+    ord <- match(rct_row_id, rct_data$ROW_ID); stopifnot(!any(is.na(ord)))
+    rct_data[ord, , drop = FALSE]
+  } else rct_data
+}
+
+# Collect masked predictions keyed by ROW_ID (length == sum(mask))
+diag_preds_m <- tibble::tibble(
+  ROW_ID  = rct_row_id[diag_idx],
+  f_r_hat = f_r_hat[diag_idx],
+  f_o_hat = f_o_hat[diag_idx],
+  f_c_ure = f_combined[diag_idx],     # λ_URE
+  f_c2    = f_combined2[diag_idx],    # row-specific λ2
+  f_MM1   = psi_MM1,                  # already masked length
+  f_MM2   = psi_MM2
+)
+
+# Columns needed from the aligned RCT frame
+diag_cols_needed <- c("ROW_ID","Outcome.CHD","Test","AGE_CAT","SMOKING","ETHNIC_GRP")
+missing_cols <- setdiff(diag_cols_needed, names(diag_rct_aligned))
+if (length(missing_cols) > 0) {
+  stop("Missing columns in rct_data: ", paste(missing_cols, collapse = ", "))
+}
+
+# Use namespaced dplyr verbs to avoid masked select()
+diag_eval_m <- diag_rct_aligned %>%
+  dplyr::select(dplyr::all_of(diag_cols_needed)) %>%
+  dplyr::inner_join(diag_preds_m, by = "ROW_ID")
+
+stopifnot(nrow(diag_eval_m) == nrow(diag_preds_m))
+```
+
+```{r}
+# ==== 1) Calibration by deciles (ATE in bins) ====
+stopifnot(exists("diag_eval_m"))
+
+diag_method_cols <- c("f_c_ure","f_c2","f_MM1","f_MM2","f_o_hat")
+
+diag_calib_tbl <- lapply(diag_method_cols, function(m) {
+  df <- diag_eval_m %>%
+    dplyr::transmute(method = m,
+                     pred = .data[[m]],
+                     Y = as.numeric(Outcome.CHD),
+                     T = as.numeric(Test)) %>%
+    dplyr::filter(is.finite(pred), !is.na(Y), !is.na(T)) %>%
+    dplyr::mutate(decile = dplyr::ntile(pred, 10))
+
+  df %>%
+    dplyr::group_by(decile) %>%
+    dplyr::summarise(
+      n  = dplyr::n(),
+      n1 = sum(T == 1L),
+      n0 = sum(T == 0L),
+      y1 = ifelse(n1 > 0, mean(Y[T == 1L]), NA_real_),
+      y0 = ifelse(n0 > 0, mean(Y[T == 0L]), NA_real_),
+      ate = ifelse(is.na(y1) | is.na(y0), NA_real_, y1 - y0),
+      var1 = ifelse(n1 > 1, stats::var(Y[T == 1L]) / n1, NA_real_),
+      var0 = ifelse(n0 > 1, stats::var(Y[T == 0L]) / n0, NA_real_),
+      se   = ifelse(is.na(ate), NA_real_,
+                    sqrt(dplyr::coalesce(var1, 0) + dplyr::coalesce(var0, 0))),
+      lo   = ifelse(is.na(se), NA_real_, ate - 1.96 * se),
+      hi   = ifelse(is.na(se), NA_real_, ate + 1.96 * se),
+      .groups = "drop"
+    ) %>%
+    dplyr::mutate(method = m)
+}) %>% dplyr::bind_rows()
+
+# --- optional: monotonicity summary (now that diag_calib_tbl exists) ---
+calib_summ <- diag_calib_tbl %>%
+  dplyr::group_by(method) %>%
+  dplyr::summarise(
+    spearman = suppressWarnings(stats::cor(decile, ate, method = "spearman", use = "complete.obs")),
+    slope    = unname(coef(stats::lm(ate ~ decile))[2])
+  ) %>%
+  dplyr::arrange(dplyr::desc(slope))
+calib_summ
+
+# plot
+ggplot2::ggplot(diag_calib_tbl, ggplot2::aes(x = decile, y = ate)) +
+  ggplot2::geom_ribbon(ggplot2::aes(ymin = lo, ymax = hi), alpha = 0.15) +
+  ggplot2::geom_line() +
+  ggplot2::facet_wrap(~ method, ncol = 3) +
+  ggplot2::labs(
+    x = "Prediction decile",
+    y = "RCT ATE within decile",
+    title = "Calibration by deciles"
+  ) +
+  ggplot2::theme_minimal(base_size = 12)
+```
+
+```{r}
+# ==== 2) Bias–variance vs RCT surface ====
+stopifnot(exists("diag_preds_m"))
+
+diag_bv_long <- diag_preds_m %>%
+  tidyr::pivot_longer(cols = c(f_c_ure, f_c2, f_MM1, f_MM2, f_o_hat),
+                      names_to = "method", values_to = "pred") %>%
+  dplyr::mutate(delta = pred - f_r_hat)
+
+diag_bv <- diag_bv_long %>%
+  dplyr::group_by(method) %>%
+  dplyr::summarise(
+    bias = mean(delta, na.rm = TRUE),
+    var  = stats::var(delta, na.rm = TRUE),
+    mse  = mean(delta^2, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  dplyr::mutate(bias2 = bias^2)
+
+ggplot2::ggplot(diag_bv, ggplot2::aes(x = stats::reorder(method, mse))) +
+  ggplot2::geom_col(ggplot2::aes(y = var), alpha = 0.7) +
+  ggplot2::geom_errorbar(ggplot2::aes(ymin = var, ymax = var + bias2), width = 0.4) +
+  ggplot2::coord_flip() +
+  ggplot2::labs(x = NULL,
+                y = "Variance (bar) with Bias^2 (errorbar top)",
+                title = "Bias–variance decomposition vs RCT surface") +
+  ggplot2::theme_minimal(base_size = 12)
+
+diag_bv
+
+```
+
+```{r}
+# ==== 3) Tail quantiles of |prediction| ====
+diag_qs <- diag_preds_m %>%
+  tidyr::pivot_longer(cols = c(f_c_ure, f_c2, f_MM1, f_MM2, f_o_hat, f_r_hat),
+                      names_to = "method", values_to = "pred") %>%
+  dplyr::group_by(method) %>%
+  dplyr::summarise(
+    median_abs = stats::median(abs(pred), na.rm = TRUE),
+    q95        = stats::quantile(abs(pred), 0.95, na.rm = TRUE, names = FALSE),
+    q99        = stats::quantile(abs(pred), 0.99, na.rm = TRUE, names = FALSE),
+    max_abs    = max(abs(pred), na.rm = TRUE),
+    prop_lt1e4 = mean(abs(pred) < 1e-4, na.rm = TRUE),
+    n          = sum(is.finite(pred)),
+    .groups    = "drop"
+  ) %>%
+  dplyr::arrange(dplyr::desc(max_abs))
+
+diag_qs
+```
+
+```{r}
+# ==== 4) Subgroups (single CSV) ====
+stopifnot(exists("diag_rct_aligned"))
+
+diag_sub_eval <- function(data, group_var,
+                          methods = c("f_c_ure","f_c2","f_MM1","f_MM2","f_o_hat")) {
+  gsym  <- rlang::ensym(group_var)
+  gname <- rlang::as_name(gsym)
+
+  data %>%
+    dplyr::select(ROW_ID, f_r_hat, dplyr::all_of(methods), {{ group_var }}) %>%
+    tidyr::pivot_longer(cols = dplyr::all_of(methods),
+                        names_to = "method", values_to = "pred") %>%
+    dplyr::group_by(method, {{ group_var }}) %>%
+    dplyr::summarise(
+      n        = sum(is.finite(pred) & is.finite(f_r_hat)),
+      cor_rct  = suppressWarnings(stats::cor(pred, f_r_hat, use = "complete.obs")),
+      rmse_rct = sqrt(mean((pred - f_r_hat)^2, na.rm = TRUE)),
+      sd_pred  = stats::sd(pred, na.rm = TRUE),
+      .groups  = "drop"
+    ) %>%
+    dplyr::mutate(subgroup_type = gname) %>%
+    dplyr::rename(level = {{ group_var }}) %>%
+    dplyr::select(subgroup_type, level, method, n, cor_rct, rmse_rct, sd_pred) %>%
+    dplyr::arrange(subgroup_type, method, level)
+}
+
+diag_sub_m <- diag_rct_aligned %>%
+  dplyr::select(ROW_ID, AGE_CAT, SMOKING, ETHNIC_GRP) %>%
+  dplyr::inner_join(diag_preds_m, by = "ROW_ID")
+
+diag_tbl_age   <- diag_sub_eval(diag_sub_m, AGE_CAT)
+diag_tbl_smoke <- diag_sub_eval(diag_sub_m, SMOKING)
+diag_tbl_eth   <- diag_sub_eval(diag_sub_m, ETHNIC_GRP)
+
+# bind all slices into one tidy table
+diag_tbl_all <- dplyr::bind_rows(diag_tbl_age, diag_tbl_smoke, diag_tbl_eth)
+
+# write single CSV in the same folder as your Rmd
+out_dir <- if (requireNamespace("here", quietly = TRUE)) here::here() else getwd()
+readr::write_csv(diag_tbl_all, file.path(out_dir, "subgroups_all.csv"))
+
+# (optional) view
+diag_tbl_all
+```
+
+```{r}
+# ==== Step 1: Calibration for RCT predictor itself (in-sample) ====
+stopifnot(exists("diag_eval_m"), "f_r_hat" %in% names(diag_eval_m))
+
+# Safe 0/1 casting helper
+to01 <- function(z) {
+  if (is.null(z)) stop("NULL passed to to01()")
+  if (is.logical(z)) return(as.integer(z))
+  if (is.numeric(z)) return(as.integer(z))
+  if (is.factor(z) || is.character(z)) return(as.integer(as.character(z)))
+  stop("Unsupported type for 0/1 casting")
+}
+
+diag_calib_tbl_rct_in <- {
+  df <- diag_eval_m %>%
+    dplyr::transmute(
+      method = "f_r_hat",
+      pred   = .data[["f_r_hat"]],
+      Y      = to01(Outcome.CHD),
+      T      = to01(Test)
+    ) %>%
+    dplyr::filter(is.finite(pred), !is.na(Y), !is.na(T)) %>%
+    dplyr::mutate(decile = dplyr::ntile(pred, 10))
+
+  df %>%
+    dplyr::group_by(decile) %>%
+    dplyr::summarise(
+      n  = dplyr::n(),
+      n1 = sum(T == 1L),
+      n0 = sum(T == 0L),
+      y1 = ifelse(n1 > 0, mean(Y[T == 1L]), NA_real_),
+      y0 = ifelse(n0 > 0, mean(Y[T == 0L]), NA_real_),
+      ate = ifelse(is.na(y1) | is.na(y0), NA_real_, y1 - y0),
+      var1 = ifelse(n1 > 1, stats::var(Y[T == 1L]) / n1, NA_real_),
+      var0 = ifelse(n0 > 1, stats::var(Y[T == 0L]) / n0, NA_real_),
+      se   = ifelse(is.na(ate), NA_real_,
+                    sqrt(dplyr::coalesce(var1, 0) + dplyr::coalesce(var0, 0))),
+      lo   = ifelse(is.na(se), NA_real_, ate - 1.96 * se),
+      hi   = ifelse(is.na(se), NA_real_, ate + 1.96 * se),
+      .groups = "drop"
+    ) %>%
+    dplyr::mutate(method = factor("f_r_hat",
+                                  levels = "f_r_hat",
+                                  labels = "RCT: f̂_r(x) (in-sample)"))
+}
+
+ggplot2::ggplot(diag_calib_tbl_rct_in, ggplot2::aes(x = decile, y = ate)) +
+  ggplot2::geom_ribbon(ggplot2::aes(ymin = lo, ymax = hi), alpha = 0.15) +
+  ggplot2::geom_line() +
+  ggplot2::labs(x = "Prediction decile", y = "RCT ATE within decile",
+                title = "Calibration (RCT predictor, in-sample)") +
+  ggplot2::theme_minimal(base_size = 12)
+
+# ---- In-sample QA + metrics (mirror of OOF) ----
+
+# 1) Arm balance per in-sample decile (sanity check)
+in_arm_counts <- diag_eval_m %>%
+  dplyr::filter(is.finite(f_r_hat)) %>%
+  dplyr::mutate(decile = dplyr::ntile(f_r_hat, 10)) %>%
+  dplyr::count(decile, Test) %>%
+  tidyr::pivot_wider(names_from = Test, values_from = n, values_fill = 0)
+in_arm_counts
+
+# 2) Lift with 95% CI + monotonicity stats (same recipe used for OOF)
+if (!exists("report_lift_ci")) {
+  report_lift_ci <- function(cal_tbl) {
+    stopifnot(all(c("decile","ate","se") %in% names(cal_tbl)))
+    lift   <- with(cal_tbl,  ate[decile == 10] - ate[decile == 1])
+    se10   <- cal_tbl$se[cal_tbl$decile == 10]; se1 <- cal_tbl$se[cal_tbl$decile == 1]
+    se_lft <- sqrt(se10^2 + se1^2)  # conservative independence bound
+    ci     <- lift + c(-1, 1) * 1.96 * se_lft
+    rho    <- suppressWarnings(cor(cal_tbl$decile, cal_tbl$ate,
+                                   method = "spearman", use = "complete.obs"))
+    slope  <- unname(coef(stats::lm(ate ~ decile, data = cal_tbl))[2])
+    tibble::tibble(lift_10_1 = lift, ci_lo = ci[1], ci_hi = ci[2],
+                   spearman = rho, slope = slope)
+  }
+}
+
+in_metrics <- report_lift_ci(diag_calib_tbl_rct_in) %>%
+  dplyr::mutate(model = "RCT: f̂_r(x) (in-sample)") %>%
+  dplyr::relocate(model)
+in_metrics
+
+# 3) OPTIONAL: side-by-side stats table if OOF metrics already exist
+if (exists("oof_metrics")) {
+  metrics_both <- dplyr::bind_rows(
+    in_metrics,
+    dplyr::mutate(oof_metrics, model = "RCT: f̂_r(x) (OOF)")
+  ) %>% dplyr::relocate(model)
+  metrics_both
+}
+
+
+```
+
+```{r}
+# ==== Step 2: Honest (OOF) RCT CATE via stratified K-fold T-learner, then calibration ====
+stopifnot(exists("diag_rct_aligned"))
+
+# Covariates (reuse your set; fall back to intersection if not in env)
+if (!exists("covars_x")) {
+  covars_x <- c("AGE_CAT","BMI","MENO_YRS","SMOKING","ETHNIC_GRP",
+                "WAIST","WEIGHT","HOTFLASH","OSTEOPOR","VIGACT")
+}
+covars_x <- intersect(covars_x, names(diag_rct_aligned))
+stopifnot(length(covars_x) > 0)
+
+# Safe cast helper (if not already defined upstream)
+if (!exists("to01")) {
+  to01 <- function(z) {
+    if (is.logical(z)) return(as.integer(z))
+    if (is.numeric(z)) return(as.integer(z))
+    if (is.factor(z) || is.character(z)) return(as.integer(as.character(z)))
+    stop("Unsupported type for to01()")
+  }
+}
+
+# Work on a COPY so we don't mutate diag_rct_aligned
+rct_cv <- diag_rct_aligned
+rct_cv$Y_bin <- to01(rct_cv$Outcome.CHD)
+rct_cv$T_bin <- to01(rct_cv$Test)
+
+set.seed(2025)
+K <- 5L                                # you can set 10L to reduce OOF noise
+N_all <- nrow(rct_cv)
+
+# Stratified folds by treatment arm (keeps balance in each fold)
+idx1 <- which(rct_cv$T_bin == 1L)
+idx0 <- which(rct_cv$T_bin == 0L)
+fold_id <- integer(N_all)
+fold_id[idx1] <- sample(rep(1:K, length.out = length(idx1)))
+fold_id[idx0] <- sample(rep(1:K, length.out = length(idx0)))
+
+# Formula: outcomes ~ covariates
+form_y <- stats::as.formula(
+  paste("Y_bin ~", paste(covars_x, collapse = " + "))
+)
+
+cate_oof_all <- rep(NA_real_, N_all)
+
+for (k in 1:K) {
+  tr <- which(fold_id != k); te <- which(fold_id == k)
+
+  df_tr <- rct_cv[tr, , drop = FALSE]
+  df_te <- rct_cv[te, , drop = FALSE]
+
+  # Fit two GLMs on the training fold (treated & control)
+  m1 <- stats::glm(form_y,
+                   data = df_tr[df_tr$T_bin == 1L, , drop = FALSE],
+                   family = stats::binomial(),
+                   control = stats::glm.control(maxit = 50),
+                   na.action = stats::na.omit)
+
+  m0 <- stats::glm(form_y,
+                   data = df_tr[df_tr$T_bin == 0L, , drop = FALSE],
+                   family = stats::binomial(),
+                   control = stats::glm.control(maxit = 50),
+                   na.action = stats::na.omit)
+
+  # Predict on held-out fold (OOF) and form CATE = p1 - p0
+  p1 <- stats::predict(m1, newdata = df_te, type = "response")
+  p0 <- stats::predict(m0, newdata = df_te, type = "response")
+  cate_oof_all[te] <- p1 - p0
+}
+
+# Attach OOF RCT predictor to your masked prediction frame (guard mapping)
+stopifnot(exists("diag_preds_m"), "ROW_ID" %in% names(diag_preds_m),
+          "ROW_ID" %in% names(rct_cv))
+
+idx_map <- match(diag_preds_m$ROW_ID, rct_cv$ROW_ID)
+has_match <- !is.na(idx_map)
+diag_preds_m$f_r_hat_oof <- NA_real_
+diag_preds_m$f_r_hat_oof[has_match] <- cate_oof_all[idx_map[has_match]]
+
+# Build a calibration table for OOF RCT predictor on the same masked rows
+stopifnot(exists("diag_eval_m"))
+diag_eval_oof <- diag_eval_m %>%
+  dplyr::select(ROW_ID, Outcome.CHD, Test) %>%
+  dplyr::left_join(diag_preds_m[, c("ROW_ID","f_r_hat_oof")], by = "ROW_ID")
+
+diag_calib_tbl_rct_oof <- {
+  df <- diag_eval_oof %>%
+    dplyr::transmute(
+      method = "f_r_hat_oof",
+      pred   = f_r_hat_oof,
+      Y      = to01(Outcome.CHD),
+      T      = to01(Test)
+    ) %>%
+    dplyr::filter(is.finite(pred), !is.na(Y), !is.na(T)) %>%
+    dplyr::mutate(decile = dplyr::ntile(pred, 10))
+
+  df %>%
+    dplyr::group_by(decile) %>%
+    dplyr::summarise(
+      n  = dplyr::n(),
+      n1 = sum(T == 1L),
+      n0 = sum(T == 0L),
+      y1 = ifelse(n1 > 0, mean(Y[T == 1L]), NA_real_),
+      y0 = ifelse(n0 > 0, mean(Y[T == 0L]), NA_real_),
+      ate = ifelse(is.na(y1) | is.na(y0), NA_real_, y1 - y0),
+      var1 = ifelse(n1 > 1, stats::var(Y[T == 1L]) / n1, NA_real_),
+      var0 = ifelse(n0 > 1, stats::var(Y[T == 0L]) / n0, NA_real_),
+      se   = ifelse(is.na(ate), NA_real_,
+                    sqrt(dplyr::coalesce(var1, 0) + dplyr::coalesce(var0, 0))),
+      lo   = ifelse(is.na(se), NA_real_, ate - 1.96 * se),
+      hi   = ifelse(is.na(se), NA_real_, ate + 1.96 * se),
+      .groups = "drop"
+    ) %>%
+    dplyr::mutate(method = factor("f_r_hat_oof",
+                                  levels = "f_r_hat_oof",
+                                  labels = "RCT: f̂_r(x) (OOF)"))
+}
+
+# Plot OOF calibration
+ggplot2::ggplot(diag_calib_tbl_rct_oof, ggplot2::aes(x = decile, y = ate)) +
+  ggplot2::geom_ribbon(ggplot2::aes(ymin = lo, ymax = hi), alpha = 0.15) +
+  ggplot2::geom_line() +
+  ggplot2::labs(x = "Prediction decile", y = "RCT ATE within decile",
+                title = "Calibration (RCT predictor, out-of-fold)") +
+  ggplot2::theme_minimal(base_size = 12)
+
+# (Optional) side-by-side: in-sample vs OOF
+diag_calib_rct_both <- dplyr::bind_rows(diag_calib_tbl_rct_in, diag_calib_tbl_rct_oof)
+ggplot2::ggplot(diag_calib_rct_both, ggplot2::aes(x = decile, y = ate)) +
+  ggplot2::geom_ribbon(ggplot2::aes(ymin = lo, ymax = hi), alpha = 0.15) +
+  ggplot2::geom_line() +
+  ggplot2::facet_wrap(~ method, ncol = 2) +
+  ggplot2::labs(x = "Prediction decile", y = "RCT ATE within decile",
+                title = "Calibration: RCT predictor (in-sample vs out-of-fold)") +
+  ggplot2::theme_minimal(base_size = 12)
+
+# ---------- NEW: concise QA & metrics you can print on the slide ----------
+
+# 1) Arm balance per OOF decile (sanity)
+oof_arm_counts <- diag_eval_oof %>%
+  dplyr::filter(is.finite(f_r_hat_oof)) %>%
+  dplyr::mutate(decile = dplyr::ntile(f_r_hat_oof, 10)) %>%
+  dplyr::count(decile, Test) %>%
+  tidyr::pivot_wider(names_from = Test, values_from = n, values_fill = 0)
+oof_arm_counts
+
+# 2) Lift with 95% CI + monotonicity stats (same recipe you used in-sample)
+report_lift_ci <- function(cal_tbl) {
+  stopifnot(all(c("decile","ate","se") %in% names(cal_tbl)))
+  lift   <- with(cal_tbl,  ate[decile==10] - ate[decile==1])
+  se10   <- cal_tbl$se[cal_tbl$decile==10]; se1 <- cal_tbl$se[cal_tbl$decile==1]
+  se_lft <- sqrt(se10^2 + se1^2)     # conservative independence bound
+  ci     <- lift + c(-1,1)*1.96*se_lft
+  rho    <- suppressWarnings(cor(cal_tbl$decile, cal_tbl$ate,
+                                 method="spearman", use="complete.obs"))
+  slope  <- unname(coef(lm(ate ~ decile, data=cal_tbl))[2])
+  tibble::tibble(lift_10_1 = lift, ci_lo = ci[1], ci_hi = ci[2],
+                 spearman = rho, slope = slope)
+}
+oof_metrics <- report_lift_ci(diag_calib_tbl_rct_oof)
+oof_metrics
+
+# 3) OPTIONAL: coarser OOF bins to stabilize (quintiles) and isotonic smoothing
+mk_calib_bins <- function(df, pred, n_bins=5) {
+  df %>%
+    dplyr::transmute(pred = .data[[pred]],
+                     Y = to01(Outcome.CHD), T = to01(Test)) %>%
+    dplyr::filter(is.finite(pred), !is.na(Y), !is.na(T)) %>%
+    dplyr::mutate(bin = dplyr::ntile(pred, n_bins)) %>%
+    dplyr::group_by(bin) %>%
+    dplyr::summarise(
+      n=dplyr::n(),
+      n1=sum(T==1L), n0=sum(T==0L),
+      y1=ifelse(n1>0, mean(Y[T==1L]), NA_real_),
+      y0=ifelse(n0>0, mean(Y[T==0L]), NA_real_),
+      ate=ifelse(is.na(y1)|is.na(y0), NA_real_, y1-y0),
+      var1=ifelse(n1>1, stats::var(Y[T==1L])/n1, NA_real_),
+      var0=ifelse(n0>1, stats::var(Y[T==0L])/n0, NA_real_),
+      se = ifelse(is.na(ate), NA_real_, sqrt(dplyr::coalesce(var1,0)+dplyr::coalesce(var0,0))),
+      .groups="drop")
+}
+# Example: quintiles (comment out if you don't want it)
+# cal_oof_q5 <- mk_calib_bins(diag_eval_oof, "f_r_hat_oof", n_bins = 5); cal_oof_q5
+
+# Example: isotonic smoothing of decile means for display (dashed line)
+# iso_fit <- stats::isoreg(diag_calib_tbl_rct_oof$decile, diag_calib_tbl_rct_oof$ate)
+# diag_calib_tbl_rct_oof$ate_iso <- iso_fit$yf
+# ggplot2::ggplot(diag_calib_tbl_rct_oof, ggplot2::aes(x = decile)) +
+#   ggplot2::geom_ribbon(ggplot2::aes(ymin = lo, ymax = hi), alpha = 0.15) +
+#   ggplot2::geom_line(ggplot2::aes(y = ate)) +
+#   ggplot2::geom_line(ggplot2::aes(y = ate_iso), linetype = 2) +
+#   ggplot2::labs(x = "Prediction decile", y = "RCT ATE within decile",
+#                 title = "OOF calibration with isotonic smoother") +
+#   ggplot2::theme_minimal(base_size = 12)
+
+```
+
+```{r}
+# --- Unified summary for any calibration table (has cols: decile, ate, se) ---
+summarize_cal <- function(cal) {
+  stopifnot(all(c("decile","ate","se") %in% names(cal)))
+  lift   <- with(cal,  ate[decile==10] - ate[decile==1])
+  se10   <- cal$se[cal$decile==10]; se1 <- cal$se[cal$decile==1]
+  se_lft <- sqrt(se10^2 + se1^2)  # conservative independence bound
+  ci     <- lift + c(-1,1)*1.96*se_lft
+  rho    <- suppressWarnings(cor(cal$decile, cal$ate,
+                                 method = "spearman", use = "complete.obs"))
+  slope  <- unname(coef(lm(ate ~ decile, data = cal))[2])
+  tibble::tibble(
+    method    = unique(as.character(cal$method)),
+    lift_10_1 = lift,
+    ci_lo     = ci[1],
+    ci_hi     = ci[2],
+    spearman  = rho,
+    slope     = slope
+  )
+}
+
+# Summarize in-sample and OOF in one table
+cal_summary <- dplyr::bind_rows(
+  summarize_cal(diag_calib_tbl_rct_in),
+  summarize_cal(diag_calib_tbl_rct_oof)
+)
+cal_summary
+
+```
+
+```{r}
 # ===== CHUNK 3b: summaries (fixed) =====
 library(dplyr)
 
@@ -679,7 +1207,7 @@ ggplot(plot_df_sub, aes(x = CATE, fill = Method)) +
 
 ```
 
-## OLD GRAPHS BELOW, IGNORE \_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_
+## OLD GRAPHS BELOW, IGNORE, DONT RUN! \_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_
 
 ```{r}
 # ---- Load libraries ----
