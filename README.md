@@ -56,7 +56,7 @@ quarto render "code/0924/0718 RCT Bootstrap.qmd"
 
 ## Research poster
 
-- `assets/research_poster.pdf` (assets/research_poster.pdf)
+- [Research poster (PDF, redacted)](assets/research_poster.pdf)
 
 ## Data and privacy
 
