@@ -34,11 +34,11 @@ Goal: estimate subgroup treatment effects (CATEs) from WHI randomized and observ
 ## Repo structure
 
 `code/0924/`
-- `0718combined_estimator.qmd`  
+- [`0718combined_estimator.qmd`](code/0924/0718combined_estimator.qmd)
   Combined estimators (λURE, λ2, moment matching), calibration, and out of sample evaluation
-- `0718 Obs CATE.qmd`  
+- [`0718 Obs CATE.qmd`](code/0924/0718%20Obs%20CATE.qmd)
   Observational CATE pipeline, including propensity score modeling and diagnostics
-- `0718 RCT Bootstrap.qmd`  
+- [`0718 RCT Bootstrap.qmd`](code/0924/0718%20RCT%20Bootstrap.qmd)
   RCT bootstrap pipeline for subgroup uncertainty estimation
 
 `outputs/0924/`
