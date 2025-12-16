@@ -34,9 +34,4 @@ Important: if you are covered by a WHI data use agreement, confirm whether deriv
 ```bash
 quarto render "code/0924/0718combined_estimator.qmd"
 
-Contact
 
-Hill Zhang
-GitHub: https://github.com/HillZhang2004
-
-Email: hillzhang.ai@gmail.com
